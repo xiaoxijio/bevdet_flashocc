@@ -343,7 +343,7 @@ class CenterHead(BaseModule):
         """
         ret_dicts = []
 
-        x = self.shared_conv(x)
+        x = self.shared_conv(x) # (B, 64, 128, 128)
 
         for task in self.task_heads:
             ret_dicts.append(task(x))
@@ -630,10 +630,10 @@ class CenterHead(BaseModule):
             ind = inds[task_id]
             pred = preds_dict[0]['anno_box'].permute(0, 2, 3, 1).contiguous()
             pred = pred.view(pred.size(0), -1, pred.size(3))
-            pred = self._gather_feat(pred, ind)
+            pred = self._gather_feat(pred, ind) # 整张网格上的预测 与 每个GT的回归目标 对应起来
             mask = masks[task_id].unsqueeze(2).expand_as(target_box).float()
             num = torch.clamp(
-                reduce_mean(target_box.new_tensor(num)), min=1e-4).item()
+                reduce_mean(num.detach().to(target_box)), min=1e-4).item()
             isnotnan = (~torch.isnan(target_box)).float()
             mask *= isnotnan
             code_weights = self.train_cfg['code_weights']

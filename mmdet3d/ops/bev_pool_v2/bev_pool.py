@@ -24,7 +24,7 @@ class QuickCumsumCuda(torch.autograd.Function):
         interval_lengths = interval_lengths.contiguous().int()
         interval_starts = interval_starts.contiguous().int()
 
-        out = feat.new_zeros(bev_feat_shape)
+        out = feat.new_zeros(bev_feat_shape)    # (B, 1, 128, 128, 64)
 
         bev_pool_v2_ext.bev_pool_v2_forward(
             depth,

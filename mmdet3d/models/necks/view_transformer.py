@@ -203,7 +203,7 @@ class LSSViewTransformer(BaseModule):
     def voxel_pooling_v2(self, coor, depth, feat):
         ranks_bev, ranks_depth, ranks_feat, \
             interval_starts, interval_lengths = \
-            self.voxel_pooling_prepare_v2(coor)
+            self.voxel_pooling_prepare_v2(coor) # 从哪里取深度概率、从哪里取64维图像特征、加到哪个BEV格子
         if ranks_feat is None:
             print('warning ---> no points within the predefined '
                   'bev receptive field')
@@ -221,7 +221,7 @@ class LSSViewTransformer(BaseModule):
                           feat.shape[-1])  # (B, Z, Y, X, C)
         bev_feat = bev_pool_v2(depth, feat, ranks_depth, ranks_feat, ranks_bev,
                                bev_feat_shape, interval_starts,
-                               interval_lengths)
+                               interval_lengths)    # 根据准备好的索引，把图像特征按深度概率加权，再累加到对应的 BEV 格子里
         # collapse Z
         if self.collapse_z:
             bev_feat = torch.cat(bev_feat.unbind(dim=2), 1)
@@ -243,33 +243,34 @@ class LSSViewTransformer(BaseModule):
         B, N, D, H, W, _ = coor.shape
         num_points = B * N * D * H * W
         # record the index of selected points for acceleration purpose
-        ranks_depth = torch.range(
-            0, num_points - 1, dtype=torch.int, device=coor.device)
-        ranks_feat = torch.range(
-            0, num_points // D - 1, dtype=torch.int, device=coor.device)
+        ranks_depth = torch.arange(
+            num_points, dtype=torch.int, device=coor.device)    # 建立深度和图像特征索引
+        ranks_feat = torch.arange(
+            num_points // D, dtype=torch.int, device=coor.device)
         ranks_feat = ranks_feat.reshape(B, N, 1, H, W)
-        ranks_feat = ranks_feat.expand(B, N, D, H, W).flatten()
+        ranks_feat = ranks_feat.expand(B, N, D, H, W).flatten() # 图像特征索引需要沿深度维重复
         # convert coordinate into the voxel space
         coor = ((coor - self.grid_lower_bound.to(coor)) /
-                self.grid_interval.to(coor))
-        coor = coor.long().view(num_points, 3)
-        batch_idx = torch.range(0, B - 1).reshape(B, 1). \
+                self.grid_interval.to(coor))    # 三维坐标 转 网格坐标 (B, 6, 59, 16, 44, 3)
+        coor = coor.long().view(num_points, 3)  # (249216, 3) [ix, iy, iz]
+        batch_idx = torch.arange(
+            B, device=coor.device, dtype=coor.dtype).reshape(B, 1). \
             expand(B, num_points // B).reshape(num_points, 1).to(coor)
-        coor = torch.cat((coor, batch_idx), 1)
+        coor = torch.cat((coor, batch_idx), 1)  # # (249216, 4) [ix, iy, iz, batch_id]
 
         # filter out points that are outside box
         kept = (coor[:, 0] >= 0) & (coor[:, 0] < self.grid_size[0]) & \
                (coor[:, 1] >= 0) & (coor[:, 1] < self.grid_size[1]) & \
-               (coor[:, 2] >= 0) & (coor[:, 2] < self.grid_size[2])
+               (coor[:, 2] >= 0) & (coor[:, 2] < self.grid_size[2]) # 过滤网格范围之外的点
         if len(kept) == 0:
             return None, None, None, None, None
         coor, ranks_depth, ranks_feat = \
-            coor[kept], ranks_depth[kept], ranks_feat[kept]
+            coor[kept], ranks_depth[kept], ranks_feat[kept] # 同步过滤
         # get tensors from the same voxel next to each other
         ranks_bev = coor[:, 3] * (
             self.grid_size[2] * self.grid_size[1] * self.grid_size[0])
         ranks_bev += coor[:, 2] * (self.grid_size[1] * self.grid_size[0])
-        ranks_bev += coor[:, 1] * self.grid_size[0] + coor[:, 0]
+        ranks_bev += coor[:, 1] * self.grid_size[0] + coor[:, 0]    # 计算 BEV 网格索引
         order = ranks_bev.argsort()
         ranks_bev, ranks_depth, ranks_feat = \
             ranks_bev[order], ranks_depth[order], ranks_feat[order]
@@ -277,12 +278,12 @@ class LSSViewTransformer(BaseModule):
         kept = torch.ones(
             ranks_bev.shape[0], device=ranks_bev.device, dtype=torch.bool)
         kept[1:] = ranks_bev[1:] != ranks_bev[:-1]
-        interval_starts = torch.where(kept)[0].int()
+        interval_starts = torch.where(kept)[0].int()    # 每个网格分组的起点
         if len(interval_starts) == 0:
             return None, None, None, None, None
         interval_lengths = torch.zeros_like(interval_starts)
         interval_lengths[:-1] = interval_starts[1:] - interval_starts[:-1]
-        interval_lengths[-1] = ranks_bev.shape[0] - interval_starts[-1]
+        interval_lengths[-1] = ranks_bev.shape[0] - interval_starts[-1] # 每个网格分组的长度
         return ranks_bev.int().contiguous(), ranks_depth.int().contiguous(
         ), ranks_feat.int().contiguous(), interval_starts.int().contiguous(
         ), interval_lengths.int().contiguous()
@@ -311,7 +312,7 @@ class LSSViewTransformer(BaseModule):
 
             bev_feat = bev_feat.squeeze(2)
         else:
-            coor = self.get_lidar_coor(*input[1:7])
+            coor = self.get_lidar_coor(*input[1:7]) # (B, 6, 59, 16, 44, 3)激光雷达坐标系位置
             bev_feat = self.voxel_pooling_v2(
                 coor, depth.view(B, N, self.D, H, W),
                 tran_feat.view(B, N, self.out_channels, H, W))

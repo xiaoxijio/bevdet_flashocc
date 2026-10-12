@@ -14,16 +14,16 @@
     ranks_depth      : input index of depth, IntTensor[n]
     ranks_feat       : input index of feat, IntTensor[n]
     ranks_bev        : output index, IntTensor[n]
-    interval_lengths : starting position for pooled point, IntTensor[n_intervals]
-    interval_starts  : how many points in each pooled point, IntTensor[n_intervals]
+    interval_starts : starting position for pooled point, IntTensor[n_intervals]
+    interval_lengths  : how many points in each pooled point, IntTensor[n_intervals]
     out              : output features, FloatTensor[b, d, h, w, c]
 */
 __global__ void bev_pool_v2_kernel(int c, int n_intervals,
-                                  const float *__restrict__ depth,
-                                  const float *__restrict__ feat,
-                                  const int *__restrict__ ranks_depth,
-                                  const int *__restrict__ ranks_feat,
-                                  const int *__restrict__ ranks_bev,
+                                  const float *__restrict__ depth,          // 深度概率
+                                  const float *__restrict__ feat,           // 图像特征
+                                  const int *__restrict__ ranks_depth,      // 深度索引
+                                  const int *__restrict__ ranks_feat,       // 图像特征索引
+                                  const int *__restrict__ ranks_bev,        // BEV 网格索引
                                   const int *__restrict__ interval_starts,
                                   const int *__restrict__ interval_lengths,
                                   float* __restrict__ out) {
@@ -37,9 +37,9 @@ __global__ void bev_pool_v2_kernel(int c, int n_intervals,
   const float* cur_depth;
   const float* cur_feat;
   for(int i = 0; i < interval_length; i++){
-    cur_depth = depth + ranks_depth[interval_start+i];
-    cur_feat = feat + ranks_feat[interval_start+i] * c + cur_c;
-    psum += *cur_feat * *cur_depth;
+    cur_depth = depth + ranks_depth[interval_start+i];  // 指向对应元素
+    cur_feat = feat + ranks_feat[interval_start+i] * c + cur_c; // 指向对应元素
+    psum += *cur_feat * *cur_depth; // 加权并累加
   }
 
   const int* cur_rank = ranks_bev + interval_start;
@@ -96,8 +96,8 @@ __global__ void bev_pool_grad_kernel(int c, int n_intervals,
     grad_sum = 0;
     for(int cur_c = 0; cur_c < c; cur_c++){
       cur_out_grad = cur_out_grad_start + cur_c;
-      cur_feat = cur_feat_start + cur_c;
-      grad_sum += *cur_out_grad * *cur_feat;
+      cur_feat = cur_feat_start + cur_c;  // 取图像特征
+      grad_sum += *cur_out_grad * *cur_feat;  // 计算每个深度概率的梯度
     }
 
     cur_depth_grad = depth_grad + ranks_depth[interval_start+i];
@@ -112,8 +112,8 @@ __global__ void bev_pool_grad_kernel(int c, int n_intervals,
       cur_rank = ranks_bev + interval_start + i;
       cur_out_grad = out_grad + *cur_rank * c + cur_c;
 
-      cur_depth = depth + ranks_depth[interval_start+i];
-      grad_sum += *cur_out_grad * *cur_depth;
+      cur_depth = depth + ranks_depth[interval_start+i];  // 取深度概率
+      grad_sum += *cur_out_grad * *cur_depth; // 计算图像特征的梯度
     }
     cur_feat_grad = feat_grad + ranks_feat[interval_start] * c + cur_c ;
     * cur_feat_grad = grad_sum;
