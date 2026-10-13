@@ -14,3 +14,6 @@ __all__ = [
     'LSSViewTransformer', 'CustomFPN', 'FPN_LSS', 'LSSViewTransformerBEVDepth',
     'LSSViewTransformerBEVStereo'
 ]
+
+from .bev_grid_adapter import BEVGridAdapter
+__all__ += ['BEVGridAdapter']

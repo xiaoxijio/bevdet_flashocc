@@ -30,3 +30,6 @@ __all__ = [
     'MinkSingleStage3DDetector', 'SASSD', 'BEVDet', 'BEVDet4D', 'BEVDepth4D',
     'BEVDetTRT', 'BEVStereo4D', 'BEVStereo4DOCC'
 ]
+
+from .bevdet_det_occ import BEVDetDetOcc
+__all__ += ['BEVDetDetOcc']

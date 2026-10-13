@@ -47,3 +47,6 @@ __all__ = [
     'RangeLimitedRandomCrop', 'RandomRotate', 'MultiViewWrapper',
     'NuScenesDatasetOccpancy'
 ]
+
+from .nuscenes_det_occ_dataset import NuScenesDatasetDetOcc
+__all__ += ['NuScenesDatasetDetOcc']

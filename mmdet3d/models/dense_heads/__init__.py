@@ -26,3 +26,6 @@ __all__ = [
     'GroupFree3DHead', 'PointRPNHead', 'SMOKEMono3DHead', 'PGDHead',
     'MonoFlexHead', 'FCAF3DHead'
 ]
+
+from .bev_occ_head import BEVOCCHead2D
+__all__ += ['BEVOCCHead2D']

@@ -36,3 +36,6 @@ __all__ = [
     'RangeLimitedRandomCrop', 'PrepareImageInputs', 'PointToMultiViewDepth',
     'LoadOccGTFromFile', 'ToEgo', 'VelocityAug', 'LoadAnnotations', 'BEVAug',
 ]
+
+from .det_occ import BEVAugDetOcc, FormatOccTargets
+__all__ += ['BEVAugDetOcc', 'FormatOccTargets']
