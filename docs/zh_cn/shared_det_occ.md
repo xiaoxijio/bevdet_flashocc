@@ -78,3 +78,34 @@ format_results 只导出检测JSON；需要保存占用输出时使用 tools/tes
 ```bash
 python -m pytest -q tests/test_models/test_shared_det_occ.py
 ```
+
+## 双预训练初始化（2026-10-13）
+
+新增配置：configs/bevdet/ep0_bevdet+flashocc/bevdet-r50-det-occ-shared-2gpu-32gb-pretrained.py。
+继承原双卡配置，仅改占用适配输出/占用头输入和隐藏通道128->256，
+img_backbone.pretrained=None（整份初始化文件已经含图像网络权重），
+以及 load_from/work_dir。原有配置和用户修改保持不变。
+
+初始化文件 ckpt/bevdet-r50-flashocc-shared-init.pth：
+共享网络、BEV Encoder、检测头完全取自 bevdet-r50-cbgs.pth；
+仅 occ_head 取自 flashocc-r50-256x704.pth；occ_adapter 随机初始化。
+FlashOCC 的 LSS/共享网络参数不会覆盖检测模型。
+这是权重初始化，不是断点续训：不恢复优化器、epoch或EMA历史。
+
+生成文件的命令（脚本拒绝覆盖已有输出，可指定新的 --out）：
+
+```bash
+python tools/merge_det_flashocc_checkpoints.py \
+  --config 'configs/bevdet/ep0_bevdet+flashocc/bevdet-r50-det-occ-shared-2gpu-32gb-pretrained.py' \
+  --det ckpt/bevdet-r50-cbgs.pth \
+  --occ ckpt/flashocc-r50-256x704.pth \
+  --out ckpt/bevdet-r50-flashocc-shared-init.pth
+
+bash tools/dist_train.sh \
+  'configs/bevdet/ep0_bevdet+flashocc/bevdet-r50-det-occ-shared-2gpu-32gb-pretrained.py' \
+  2 --validate
+```
+
+迁移租赁服务器时，需要同时复制新增配置和合并初始化文件（约173MiB），
+或者复制两个源权重和合并脚本，在服务器重新生成。
+占用头的输入特征/网格与原FlashOCC不同，需联合训练，不保证初始占用精度。
