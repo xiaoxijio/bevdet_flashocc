@@ -19,6 +19,7 @@ model = dict(
                   use_mask=True, num_classes=18, use_predicter=True,
                   class_balance=False,
                   loss_occ=dict(type='CrossEntropyLoss', use_sigmoid=False,
+                                avg_non_ignore=True,
                                 ignore_index=255, loss_weight=1.)),
     occ_loss_weight=1.)
 

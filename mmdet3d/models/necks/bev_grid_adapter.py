@@ -25,7 +25,8 @@ class BEVGridAdapter(nn.Module):
         self.proj = nn.Sequential(nn.Conv2d(in_channels, out_channels, 1), nn.ReLU())
 
     def forward(self, x):
-        if x.shape[-2:] != (self.src_size, self.src_size):
+        if (not torch.onnx.is_in_onnx_export()
+                and x.shape[-2:] != (self.src_size, self.src_size)):
             raise ValueError('BEV feature shape does not match src_grid')
         grid = self.sample_grid.to(x).expand(x.shape[0], -1, -1, -1)
         x = F.grid_sample(x, grid, mode='bilinear', padding_mode='zeros',
