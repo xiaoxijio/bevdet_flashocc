@@ -3,6 +3,7 @@
 # Apache-2.0; see third_party/flashocc/LICENSE and README.md for local changes.
 import torch
 from torch import nn
+from torch.nn import functional as F
 import numpy as np
 from mmcv.cnn import ConvModule
 from mmcv.runner import BaseModule
@@ -41,8 +42,16 @@ class BEVOCCHead2D(BaseModule):
                  use_predicter=True,
                  class_balance=False,
                  loss_occ=None,
+                 feature_upsample_scale=1,
+                 feature_align_corners=False,
                  ):
         super(BEVOCCHead2D, self).__init__()
+        if isinstance(feature_upsample_scale, bool) or not isinstance(feature_upsample_scale, int) or feature_upsample_scale < 1:
+            raise ValueError('feature_upsample_scale must be a positive integer')
+        if feature_upsample_scale != 1 and not use_predicter:
+            raise ValueError('Feature upsampling requires use_predicter=True')
+        self.feature_upsample_scale = feature_upsample_scale
+        self.feature_align_corners = feature_align_corners
         self.in_dim = in_dim
         self.out_dim = out_dim
         self.Dz = Dz
@@ -83,7 +92,14 @@ class BEVOCCHead2D(BaseModule):
 
         """
         # (B, C, Dy, Dx) --> (B, C, Dy, Dx) --> (B, Dx, Dy, C)
-        occ_pred = self.final_conv(img_feats).permute(0, 3, 2, 1)
+        # Heavy 3x3 convolution runs on the coarse grid. Restore feature
+        # resolution before the per-position predictor and the original loss.
+        features = self.final_conv(img_feats)
+        if self.feature_upsample_scale != 1:
+            features = F.interpolate(features,
+                scale_factor=self.feature_upsample_scale, mode='bilinear',
+                align_corners=self.feature_align_corners)
+        occ_pred = features.permute(0, 3, 2, 1)
         bs, Dx, Dy = occ_pred.shape[:3]
         if self.use_predicter:
             # (B, Dx, Dy, C) --> (B, Dx, Dy, 2*C) --> (B, Dx, Dy, Dz*n_cls)

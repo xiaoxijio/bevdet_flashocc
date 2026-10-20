@@ -17,6 +17,7 @@ from mmdet3d.models import build_model
 from pyquaternion import Quaternion
 
 from bev_occ_visualization import SceneRenderer, select_frames, scene_name
+from bev_occ_reporting import create_report_run, file_identity, save_report
 
 def main():
     p=argparse.ArgumentParser(description=__doc__)
@@ -50,6 +51,13 @@ def main():
     for i in run_indices:
         if not Path(dataset._occ_path(i)).is_file(): raise FileNotFoundError(dataset._occ_path(i))
     output=Path(args.out_dir).resolve();output.mkdir(parents=True,exist_ok=True)
+    report_archive = report_metadata = None
+    if not (args.vis_only or args.smoke_test):
+        report_archive, report_metadata = create_report_run(output, dict(
+            config=file_identity(args.config), checkpoint=file_identity(args.checkpoint),
+            command=sys.argv, arguments=vars(args), num_samples=len(run_indices),
+            status='running'), resolved_config=cfg.pretty_text)
+        print('Evaluation archive:', report_archive)
     model=build_model(cfg.model,test_cfg=cfg.get('test_cfg'))
     checkpoint=torch.load(args.checkpoint,map_location='cpu')
     state=checkpoint.get('state_dict',checkpoint)
@@ -96,10 +104,17 @@ def main():
     np.save(output/'occ_confusion.npy',hist)
     (output/'occ_metrics.json').write_text(json.dumps(metrics,indent=2))
     print('\nOccupancy metrics:',json.dumps(metrics,indent=2))
+    # Persist OCC report before the potentially memory-heavy detection evaluator.
+    save_report(output, report_archive, metrics, report_metadata,
+                status='occ_complete_detection_skipped' if args.skip_det_eval
+                else 'occ_complete_detection_pending')
     if not args.skip_det_eval:
         det_metrics=dataset.evaluate(detections,metric='bbox',jsonfile_prefix=str(output/'detection'))
         metrics.update({k:float(v) for k,v in det_metrics.items()})
-    (output/'metrics.json').write_text(json.dumps(metrics,indent=2))
+    save_report(output, report_archive, metrics, report_metadata,
+                status='occ_complete_detection_skipped' if args.skip_det_eval else 'complete')
+    print('Text report:', output/'metrics.txt')
+    print('Archived results:', report_archive)
     print('All metrics:',json.dumps(metrics,indent=2));print('Results:',output)
 
 if __name__=='__main__':main()

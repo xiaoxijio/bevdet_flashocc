@@ -20,14 +20,22 @@ class FPN_LSS(nn.Module):
                  norm_cfg=dict(type='BN'),
                  extra_upsample=2,
                  lateral=None,
-                 use_input_conv=False):
+                 use_input_conv=False,
+                 channels_factor=None,
+                 align_corners=True):
         super().__init__()
         self.input_feature_index = input_feature_index
         self.extra_upsample = extra_upsample is not None
         self.up = nn.Upsample(
-            scale_factor=scale_factor, mode='bilinear', align_corners=True)
+            scale_factor=scale_factor, mode='bilinear', align_corners=align_corners)
         # assert norm_cfg['type'] in ['BN', 'SyncBN']
-        channels_factor = 2 if self.extra_upsample else 1
+        # None preserves legacy topology/checkpoint shapes.
+        if channels_factor is None:
+            channels_factor = 2 if self.extra_upsample else 1
+        if isinstance(channels_factor, bool) or not isinstance(channels_factor, int) or channels_factor < 1:
+            raise ValueError('channels_factor must be a positive integer')
+        self.channels_factor = channels_factor
+        self.align_corners = align_corners
         self.input_conv = nn.Sequential(
             nn.Conv2d(
                 in_channels,
@@ -66,7 +74,7 @@ class FPN_LSS(nn.Module):
                 nn.Upsample(
                     scale_factor=extra_upsample,
                     mode='bilinear',
-                    align_corners=True),
+                    align_corners=align_corners),
                 nn.Conv2d(
                     out_channels * channels_factor,
                     out_channels,

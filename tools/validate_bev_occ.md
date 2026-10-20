@@ -83,3 +83,22 @@ python tools/validate_bev_occ.py \
 ```bash
 python -m pytest -q tests/test_tools/test_bev_occ_visualization.py
 ```
+
+## 评估结果持久保存
+
+`tools/validate_bev_occ.py`正式评估会自动保存：
+
+- `metrics.txt`：便于阅读的Det总指标、逐类别AP/误差、OCC逐类别IoU和mIoU。
+- `metrics.json`：原始指标数值，便于程序比较。
+- `run_metadata.json`：配置/权重路径和SHA256、命令参数、样本数及运行状态。
+- `reports/<UTC时间_唯一ID>/`：每次运行独立归档上述文件和展开后的`config.py`。
+
+输出目录根部保存最近一次结果；历史指标归档不会被下一次运行覆盖。
+检测评估开始前先保存OCC报告，并将状态标为`occ_complete_detection_pending`；
+检测评估成功后状态为`complete`。`--skip-det-eval`时状态为
+`occ_complete_detection_skipped`，检测指标显示N/A，避免误当作完整验证。
+`--vis-only` / `--smoke-test`不计算正式指标，也不生成这些评估报告。
+历史归档保存指标及配置/权重身份信息，不复制checkpoint、图片、视频或detections.pkl。
+
+建议每组仍使用独立的`--out-dir`；日常直接查看对应目录的`metrics.txt`即可，
+不需要重跑验证或依赖终端记录。mAP/NDS使用0–1数值，OCC IoU/mIoU使用百分数。

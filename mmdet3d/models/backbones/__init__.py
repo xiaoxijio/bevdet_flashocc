@@ -17,3 +17,6 @@ __all__ = [
     'MultiBackbone', 'DLANet', 'MinkResNet', 'CustomResNet', 'CustomResNet3D',
     'SwinTransformer'
 ]
+
+from .efficientnet_b0_nose import EfficientNetB0NoSE
+__all__ += ["EfficientNetB0NoSE"]
