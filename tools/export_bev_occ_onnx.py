@@ -1,4 +1,4 @@
-"""One-command joint Det/OCC export with fixed standard-ONNX BEV pooling."""
+"""Export joint Det/OCC with fixed pooling and NCHW OCC logits [B,Dz*C,Y,X]."""
 import argparse
 import os
 import sys
@@ -8,6 +8,7 @@ sys.path.insert(0, os.getcwd())
 import numpy as np
 import onnx
 import torch
+from torch.nn import functional as F
 from mmcv import Config
 from mmdet3d.datasets import build_dataset, build_dataloader
 from mmdet3d.models import build_model
@@ -53,10 +54,45 @@ class FixedPool(torch.nn.Module):
         bev[self.bev_indices] = sums
         return bev.reshape(1, self.height, self.width, self.channels).permute(0, 3, 1, 2).contiguous()
 
+class ExportOccHeadNCHW(torch.nn.Module):
+    """Reuse trained OCC weights while keeping all features/logits in NCHW.
+
+    Output channel z * num_classes + c represents height z and class c.
+    To recover legacy logits [B,X,Y,Z,C]:
+        raw.reshape(B, Z, C, Y, X).permute(0, 4, 3, 1, 2)
+    """
+    def __init__(self, head):
+        super().__init__()
+        self.head = head
+        if head.use_predicter:
+            predictor = head.predicter
+            if (not isinstance(predictor, torch.nn.Sequential) or len(predictor) != 3
+                    or not isinstance(predictor[0], torch.nn.Linear)
+                    or not isinstance(predictor[1], torch.nn.Softplus)
+                    or not isinstance(predictor[2], torch.nn.Linear)
+                    or predictor[2].out_features != head.Dz * head.num_classes):
+                raise ValueError('NCHW export requires Linear/Softplus/Linear OCC predictor')
+
+    def forward(self, features):
+        head = self.head
+        features = head.final_conv(features)
+        scale = getattr(head, 'feature_upsample_scale', 1)
+        if scale != 1:
+            features = F.interpolate(features, scale_factor=scale, mode='bilinear',
+                align_corners=head.feature_align_corners)
+        if head.use_predicter:
+            first, activation, last = head.predicter
+            features = F.conv2d(features, first.weight[:, :, None, None], first.bias)
+            features = activation(features)
+            features = F.conv2d(features, last.weight[:, :, None, None], last.bias)
+        return features
+
+
 class ExportModel(torch.nn.Module):
     def __init__(self, model, pool):
         super().__init__()
         self.model, self.pool = model, pool
+        self.occ_export = ExportOccHeadNCHW(model.occ_head)
 
     def forward(self, img):
         m = self.model
@@ -69,7 +105,7 @@ class ExportModel(torch.nn.Module):
         feat = x[:, d:d + m.img_view_transformer.out_channels].permute(0, 2, 3, 1)
         bev = m.bev_encoder(self.pool(depth, feat))
         det = m.pts_bbox_head([bev])
-        return tuple([task[0][key] for task in det for key in KEYS] + [m.occ_head(m.occ_adapter(bev))])
+        return tuple([task[0][key] for task in det for key in KEYS] + [self.occ_export(m.occ_adapter(bev))])
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
@@ -149,10 +185,14 @@ def main():
     graph = onnx.load(str(output))
     graph = onnx.shape_inference.infer_shapes(graph, strict_mode=True)
     onnx.checker.check_model(graph, full_check=True)
+    graph.graph.output[-1].doc_string = (
+        'NCHW OCC logits [B,Dz*num_classes,Y,X]; channel=z*num_classes+class. '
+        'Legacy [B,X,Y,Z,C] = raw.reshape(B,Z,C,Y,X).transpose(0,4,3,1,2).')
     onnx.save(graph, str(output))
     if any(n.domain for n in graph.graph.node):
         raise ValueError('Unexpected custom ONNX operator')
     print('Exported:', output)
+    print('OCC output: NCHW [B,Dz*num_classes,Y,X], channel=z*num_classes+class')
     print('Fixed geometry:', args.geometry_npz or f'validation sample {args.sample_index}')
     for name, tensor in zip(names, outputs):
         print(name, tuple(tensor.shape))
