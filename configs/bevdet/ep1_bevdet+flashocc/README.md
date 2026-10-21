@@ -39,8 +39,12 @@ MMCV使用非严格初始化：加载名称及shape相同的参数，报告并�
 因此启动时的shape mismatch / missing / unexpected key提示是预期的初始化提示，
 不能把这些配置直接当作原始epoch20模型评估，也不要用`--resume-from`恢复旧架构。
 
-训练继承原2卡配方：每卡4样本、20 epoch、warmup及[16,19]学习率衰减，
-初始学习率改为5e-5作为微调起点；G4更换了backbone，学习率和训练时长需根据收敛情况调整。
+G1直接继承`../ep0_bevdet+flashocc/bevdet-r50-det-occ-shared.py`，G2/G3/G4逐级继承G1，
+不再经过2卡或合并预训练配置。训练使用4卡、每卡2样本，总batch为8；
+保持20 epoch、500步linear warmup、[16,19]学习率衰减、EMA init_updates=0，
+初始学习率保留5e-5作为微调起点，不要传`--autoscale-lr`。
+G1/G2/G3的ResNet不额外加载ImageNet权重，由`load_from`初始化；G4仍使用其显式指定的B0权重。
+G4更换了backbone，学习率和训练时长需根据收敛情况调整。
 不自动开始训练，不覆盖ep0配置或checkpoint，每组有独立work_dir。
 
 ```bash
@@ -50,7 +54,7 @@ conda activate bevdet
 # G1；依次更换为G2/G3/G4配置即可。四组应分别运行。
 bash tools/dist_train.sh \
   'configs/bevdet/ep1_bevdet+flashocc/bevdet-r50-det-occ-g1-occ128.py' \
-  2 --validate
+  4 --validate
 ```
 
 如果要接着上一组的已训练权重做进一步微调，可显式覆盖初始化来源：
@@ -58,7 +62,7 @@ bash tools/dist_train.sh \
 ```bash
 bash tools/dist_train.sh \
   'configs/bevdet/ep1_bevdet+flashocc/bevdet-r50-det-occ-g2-occ08.py' \
-  2 --validate --cfg-options load_from=work_dirs/ep1_g1_occ128/epoch_20_ema.pth
+  4 --validate --cfg-options load_from=work_dirs/ep1_g1_occ128/epoch_20_ema.pth
 ```
 
 如需隔离某项改动而不累计，可通过`--cfg-options`覆盖继承项，或复制配置后更改基类；
