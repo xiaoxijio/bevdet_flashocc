@@ -1,86 +1,141 @@
-# Det + OCC ONNX导出：固定几何与运行时几何
+# BEVDet + FlashOCC：ONNX 导出与缓存映射
 
-在3090的`/home/fjm/tong/BEVDet`根目录、`bevdet`环境执行。
-此脚本当前使用`--config`指定配置（可省略，默认ep0预训练配置），使用`--checkpoint`指定权重（可省略，默认`ckpt/epoch_20_ema.pth`），唯一位置参数为output。
+在 3090 的 `/home/fjm/tong/BEVDet` 根目录激活 `bevdet` 环境后执行。
+脚本保留两种模式：固定映射、运行时加载缓存映射。
+默认配置为 `configs/bevdet/ep0_bevdet+flashocc/bevdet-r50-det-occ-shared-2gpu-32gb-pretrained.py`，
+默认权重为 `ckpt/epoch_20_ema.pth`；可以通过 `--config` 和 `--checkpoint` 修改。
+输出路径使用 `--output` 指定，不是位置参数。可加 `--device cpu` 在 CPU 上导出。
+
+## 固定映射
 
 ```bash
-# 固定几何，默认模式：ONNX只有img输入
-python tools/export_bev_occ_onnx.py \
-  --config 'configs/bevdet/ep0_bevdet+flashocc/bevdet-r50-det-occ-shared-2gpu-32gb-pretrained.py' \
-  --checkpoint ckpt/epoch_20_ema.pth onnx/bev_occ/bev_occ_fixed.onnx
-
-# 不固定几何：外参/内参/图像与BEV增强变换在推理时提供
-python tools/export_bev_occ_onnx.py \
-  --config 'configs/bevdet/ep0_bevdet+flashocc/bevdet-r50-det-occ-shared-2gpu-32gb-pretrained.py' \
-  --checkpoint ckpt/epoch_20_ema.pth onnx/bev_occ/bev_occ_dynamic.onnx \
-  --dynamic-geometry
+python tools/export_bev_occ_onnx.py --output onnx/bev_occ.onnx
 ```
 
-可加`--device cpu`在CPU上导出，输入接口不受导出设备影响。
-`--sample-index`在固定模式决定冻结的几何，在动态模式只决定示例输入，不会冻结几何。
-`--geometry-npz`仍支持原有sensor2egos/ego2globals/intrins/post_rots/post_trans/bda数据；
-导出前会先调用`prepare_inputs`对齐参考帧。
+不加模式参数时默认使用固定映射，模型只有 `img` 一个输入。
+映射由 `--sample-index` 指定的验证样本生成，默认第 0 个样本；
+也可以通过 `--geometry-npz` 提供实际车辆的标定数据。
+此模式把映射写入模型常量，修改映射需要重新导出和编译。
 
-## 动态模式的六个输入
+## 缓存映射
 
-| 名称 | shape（默认配置） | dtype | 含义 |
-|---|---|---|---|
-| img | [6,3,256,704] | float32 | 同一帧六路预处理图像 |
-| sensor2keyegos | [1,6,4,4] | float32 | 各相机sensor到参考key ego坐标系的变换 |
-| intrins_inv | [1,6,3,3] | float32 | 原始相机内参的逆矩阵 |
-| post_rots_inv | [1,6,3,3] | float32 | 图像旋转/缩放变换的逆矩阵 |
-| post_trans | [1,6,3] | float32 | 图像变换的平移部分 |
-| bda | [1,4,4] | float32 | BEV增强变换；普通部署一般为单位矩阵 |
+```bash
+python tools/export_bev_occ_onnx.py \
+  --runtime-mapping --output onnx/bev_occ_mapping.onnx
+```
 
-原始intrins和post_rots必须可逆；在CPU预处理计算其逆矩阵，作为运行时输入。
-图像、标定、相机顺序、参考帧必须对应。
-` sensor2keyegos = inverse(keyego2global) @ ego2globals @ sensor2egos `。
-nuScenes六路图像可能不是同一采集时刻，不可直接把原始sensor2egos当作sensor2keyegos。
-对于同步、固定机架且以当前自车为参考的相机，可按实际坐标约定提供相应外参。
+此模式在导出前计算投影映射，推理时接收图像和缓存映射，
+图内不再计算相机投影，也不使用 ScatterND 聚合。
+生成三个文件：
 
-不固定几何不代表动态分辨率/动态batch：batch固定为1，camera数、图像尺寸、depth bins和BEV网格仍由配置决定。
-改动几何后会在图内重新计算射线坐标、体素索引及累加，无冻结索引、Sort或NonZero。
-本实现不在ONNX内手写矩阵求逆，以避免额外的逆矩阵舍入误差。示例真实样本的PyTorch坐标与体素分配已对齐原模型；
-不同执行后端仍可能产生float32舍入差异，评估时需与原模型比较。
+- `bev_occ_mapping.onnx`：待编译的模型。
+- `bev_occ_mapping.mapping.json`：共享映射规格，记录各组容量和网格、图像等约束。
+- `bev_occ_mapping.inputs.npz`：示例图像及全部映射输入。
 
-## 输出与示例
+各组容量在导出时固定，默认 `--mapping-reserve 1.5` 为示例分组数量预留余量。
+这不保证所有车辆都能容纳：应先用车队的实际标定检查映射是否符合共享规格，再确定最终模型。
+容量不足时程序报错，不会截断投影点；扩大容量会增加计算量和内存开销，并需要重新导出、编译。
 
-两种模式均输出6个检测张量及`occ_logits`：`[1,288,200,200]`。
-OCC通道`z*18+c`对应高度z、类别c；恢复原始logits布局：
+### 为另一辆车生成映射
+
+保留首次导出的共享规格，使用新车标定生成新映射：
+
+```bash
+python tools/export_bev_occ_onnx.py \
+  --runtime-mapping --mapping-only \
+  --mapping-layout onnx/bev_occ_mapping.mapping.json \
+  --geometry-npz car002_geometry.npz \
+  --output onnx/car002.onnx --device cpu
+```
+
+这条命令只生成 `onnx/car002.inputs.npz`，不会创建 `car002.onnx`，也不会修改原 ONNX 或 ORTM。
+相同模型规格、共享容量足够时，不同车辆可共用一份编译后的模型，只需加载各自的映射。
+修改相机数量、图像尺寸、深度划分、BEV 网格或映射容量，需要重新导出和编译。
+
+当前 `--mapping-only` 是离线准备命令，仍加载配置、权重和验证数据，但跳过网络前向和 ONNX 导出。
+NPZ 内的图像是验证示例；实际部署应传入每帧真实图像，并复用该车的缓存映射。
+如果运动补偿使相机到参考车体的有效变换逐帧变化，映射也需相应更新。
+
+### 标定文件要求
+
+`--geometry-npz` 包含以下 float32 数组（默认六相机、batch=1）：
+
+| 名称 | 形状 | 含义 |
+|---|---|---|
+| sensor2egos | [1,6,4,4] | 相机到各自采集时刻车体的变换 |
+| ego2globals | [1,6,4,4] | 各相机时刻车体到全局坐标系的变换 |
+| intrins | [1,6,3,3] | 相机内参 |
+| post_rots | [1,6,3,3] | 图像旋转、缩放等预处理变换 |
+| post_trans | [1,6,3] | 图像预处理平移 |
+| bda | [1,4,4] | BEV 增强变换，普通部署通常为单位矩阵 |
+
+脚本沿用原模型的 `prepare_inputs`，将各相机对齐到参考车体坐标系：
+`sensor2keyegos = inverse(keyego2global) @ ego2globals @ sensor2egos`。
+图像预处理、相机顺序、内外参和参考时刻必须对应。
+nuScenes 六路图像可能不同步，不能直接用安装外参替代完整的参考帧变换。
+
+### 映射输入与精度
+
+所有映射输入以 float32 保存。索引采用 1024 进制的高、低两部分：
+
+- `ranks_depth_<bound>`、`ranks_feat_<bound>`：形状 `[2,slots,bound]`。
+- `bev_slots`：形状 `[2,H*W]`。
+- `pool_mask_<bound>`：形状 `[slots,bound,1]`，取值为 0 或 1。
+
+索引分量 0 为低位、分量 1 为高位，各分量范围为 `[0,1023]`，FP16 可精确表示。
+图内恢复整数索引：`low + high * 1024`。
+SDK 输入配置不支持直接使用 I32 二进制输入，因此采用上述编码。
+不要将索引分量量化为 S8，否则索引舍入会改变聚合位置。
+恢复整数前保留分组的二维结构，避免长度超过 65535 的扁平向量触发 SDK 无法打包的软件转换算子。
+
+## SDK 编译与性能仿真
+
+将 ONNX 和示例 NPZ 复制到 PC SDK 的
+`npu_toolchain/common/samples/data/model/bev_occ/`，
+然后进入 `npu_toolchain/common/samples/app/tda4/mod/bev_occ/`，激活 `sdk` 环境执行：
+
+```bash
+bash 00_init.sh bev_occ_mapping
+python prepare_mapping_calibration.py \
+  --npz ../../../../data/model/bev_occ/bev_occ_mapping.inputs.npz
+bash 01_check.sh bev_occ_mapping --config input_cfg_mapping.yml
+bash 03_omg.sh bev_occ_mapping --config input_cfg_mapping.yml
+# 仿真程序尚未构建，或 build_sim 已删除时执行
+bash 04_build.sh
+bash 05_inference.sh --model-name bev_occ_mapping --mode perf --tag mapping_epoch20
+```
+
+准备脚本生成各输入二进制、校准清单和 YAML，并在 `quant.quant_tensors` 中请求映射输入使用 FP16；
+SDK 可能在整数索引路径保留 FP32，这仍可精确表示这些分量。
+已有输出不会被覆盖；重复准备时通过 `--out-dir` 和 `--config` 指定新目录、配置。
+可重复传入 `--npz`，使用多个真实样本准备校准集。单个示例只用于跑通流程，不代表量化精度通过。
+
+NPZ 是容器，不是 SDK 运行器可以直接读取的二进制输入文件。
+00–03 的用途不变，但缓存映射模型必须使用匹配的多输入配置。
+04 构建通用仿真程序，更换模型通常无需重跑。
+当前 05 的 `perf` 可估算模型性能；`infer` 仍只支持单图像输入，多输入数值推理需要另行适配运行器。
+仿真估算不代表板端实测，也不包含完整应用的图像预处理和检测后处理。
+
+## 输出布局
+
+默认 ep0 配置输出 6 个检测张量及 `occ_logits`，后者为 `[1,288,200,200]`。
+OCC 使用 NCHW，通道 `z*18+c` 对应高度 z、类别 c；其他配置以实际导出形状为准。
+恢复原始布局和标签：
 
 ```python
 legacy = raw.reshape(1, 16, 18, 200, 200).transpose(0, 4, 3, 1, 2)
 labels = raw.reshape(1, 16, 18, 200, 200).argmax(2).transpose(0, 3, 2, 1)
 ```
 
-动态模式另保存`<output>.inputs.npz`（例如`bev_occ_dynamic.inputs.npz`），
-包含六个输入的示例值，可用`np.load`读取。它是NPZ容器，不是SDK运行器可直接读取的输入binary；
-SDK运行与量化需要将每个张量单独保存为连续binary，并按模型输入名/顺序组织多输入数据。
-固定模式仍只有一个图像输入。
+## 验证情况
 
-## SDK部署边界
-
-动态模式使用ONNX opset16的标准`ScatterND(reduction="add")`：同一体素的多个射线必须相加，
-不能改成默认覆盖写入，否则结果错误。该实现避免冻结投影，不使用CUDA/MMDeploy自定义节点。
-
-已验证原视角变换参考值、同一ONNX更换外参后的结果、重复索引累加、全投影越界情况，以及完整模型导出和ONNX checker。
-**不表示当前OMG版本已支持ScatterND-add的编译或量化执行。** 必须使用六输入配置重新执行OMG检查，
-必要时确认厂商是否支持该reduction；不应通过忽略reduction或固定索引来强行编译。
-原有SDK `input_cfg.yml`只声明img，现有`05_inference.sh`的infer也只支持单图像输入，不能原样运行这个六输入模型。
-本次没有修改量化校准清单、SDK运行脚本或原来的ORTM。
-
-测试：
+缓存映射测试覆盖同一个 ONNX 更换映射、空映射、容量不足报错、较大索引经 FP16 编码后精确恢复。
+epoch20 完整模型已通过 ONNX 检查，并使用 OMG 2.1.6 / LQ560ProV200 成功生成完整 ORTM。
+另一个真实验证样本可更换全部 31 个映射张量，输入形状保持不变，无需重新导出 ONNX。
+上述验证不代表量化后的数值精度和模型速度已通过验收；运行时索引的 Gather 可能无法获得常量索引的全部编译优化。
 
 ```bash
-python -m pytest -q tests/test_tools/test_export_bev_occ_dynamic.py tests/test_tools/test_export_bev_occ_nchw.py
+python -m pytest -q \
+  tests/test_tools/test_export_bev_occ_mapping.py \
+  tests/test_tools/test_export_bev_occ_nchw.py
 ```
-
-## SDK高维广播兼容
-
-动态投影已改为展平射线后的逐分量Mul/Add，避免原来的7维矩阵广播在SDK内部产生8维view，同时避免动态batch.gemm内核限制。
-Lift特征乘法也改成低维布局，中间几何/池化张量不超过4维；六输入接口和外部校准binary保持不变。
-遇到旧模型的EXPAND_BROADCAST维数越界，需要用当前脚本重新导出、复制到SDK模型源目录，再执行00/01/03。
-算子类型检查通过不等于后端完整编译成功。
-
-2026-10-20：逐分量低维版本已使用epoch20权重和一帧校准示例，在SDK 2.1.6/LQ560ProV200上完成OMG完整编译并生成ORTM（验证在PC临时目录进行）。
-这确认后端能生成模型，不代表完整数值仿真、量化精度或其他几何范围已经验证。旧ONNX不会自动更新，需重新导出并复制后再编译。

@@ -1,5 +1,7 @@
-"""Export joint Det/OCC with optional runtime geometry and NCHW OCC logits."""
+"""Export joint Det/OCC with fixed geometry or cached maps; NCHW OCC logits."""
 import argparse
+import json
+import hashlib
 import os
 import sys
 import warnings
@@ -12,6 +14,8 @@ from torch.nn import functional as F
 from mmcv import Config
 from mmdet3d.datasets import build_dataset, build_dataloader
 from mmdet3d.models import build_model
+
+from tools.bev_occ_mapping import RuntimeMappingPool, make_layout, make_mapping, mapping_names
 
 KEYS = ['reg', 'height', 'dim', 'rot', 'vel', 'heatmap']
 
@@ -53,95 +57,6 @@ class FixedPool(torch.nn.Module):
         bev = feat.new_zeros((self.height * self.width, self.channels))
         bev[self.bev_indices] = sums
         return bev.reshape(1, self.height, self.width, self.channels).permute(0, 3, 1, 2).contiguous()
-
-class _ScatterSum(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, base, indices, values):
-        return base.index_add(0, indices.reshape(-1), values)
-
-    @staticmethod
-    def symbolic(graph, base, indices, values):
-        # Duplicate voxel indices MUST accumulate, not overwrite. Opset >=16.
-        return graph.op('ScatterND', base, indices, values,
-                        reduction_s='add').setType(base.type())
-
-
-class RuntimeGeometryPool(torch.nn.Module):
-    """Batch=1 LSS with runtime geometry and standard ONNX ScatterND-add.
-
-    The number/order of cameras, image size, depth bins and BEV grid stay fixed.
-    Calibration, augmentation and projected voxel membership remain runtime data.
-    No data-dependent NonZero/Sort or frozen projection indices are used.
-    """
-    def __init__(self, frustum, grid_lower_bound, grid_interval, grid_size, channels):
-        super().__init__()
-        self.height, self.width = int(grid_size[1]), int(grid_size[0])
-        if int(grid_size[2]) != 1:
-            raise ValueError('Runtime geometry supports a single BEV Z bin')
-        self.channels = channels
-        self.register_buffer('frustum', frustum.detach().clone())
-        self.register_buffer('lower_bound', grid_lower_bound.detach().clone())
-        self.register_buffer('interval', grid_interval.detach().clone())
-        self.register_buffer('grid_size', grid_size.detach().clone().long())
-        self.register_buffer('empty_bev', torch.zeros(self.height * self.width, channels))
-
-    @staticmethod
-    def apply_matrix3(matrix, points):
-        # SDK dynamic batch.gemm cannot compile the skinny 3x3 ray transforms.
-        # Explicit scalar components keep broadcasts at rank 2 and use Mul/Add.
-        x, y, z = points[..., 0], points[..., 1], points[..., 2]
-        rows = []
-        for row in range(3):
-            rows.append(matrix[:, row, 0:1] * x
-                        + matrix[:, row, 1:2] * y
-                        + matrix[:, row, 2:3] * z)
-        return torch.stack(rows, dim=-1)
-
-    def coordinates(self, sensor2keyegos, intrins_inv, post_rots_inv, post_trans, bda):
-        cameras = sensor2keyegos.shape[1]
-        points = self.frustum.reshape(1, -1, 3).expand(cameras, -1, -1)
-        points = points - post_trans.reshape(cameras, 1, 3)
-        points = self.apply_matrix3(post_rots_inv.reshape(cameras, 3, 3), points)
-        points = torch.cat((points[..., :2] * points[..., 2:3],
-                            points[..., 2:3]), dim=-1)
-        rotation = sensor2keyegos[:, :, :3, :3].reshape(cameras, 3, 3)
-        intrinsic = intrins_inv.reshape(cameras, 3, 3)
-        rows = []
-        for row in range(3):
-            rows.append(rotation[:, row, 0:1] * intrinsic[:, 0, :]
-                        + rotation[:, row, 1:2] * intrinsic[:, 1, :]
-                        + rotation[:, row, 2:3] * intrinsic[:, 2, :])
-        combine = torch.stack(rows, dim=1)
-        points = self.apply_matrix3(combine, points)
-        points = points + sensor2keyegos[:, :, :3, 3].reshape(cameras, 1, 3)
-        points = self.apply_matrix3(bda[:, :3, :3], points.reshape(1, -1, 3))
-        return points.reshape(-1, 3) + bda[0, :3, 3]
-
-    def forward(self, depth, feat, sensor2keyegos, intrins_inv, post_rots_inv, post_trans, bda):
-        points = self.coordinates(sensor2keyegos, intrins_inv, post_rots_inv, post_trans, bda)
-        # Match the training implementation's cast (truncate towards zero).
-        voxels = ((points - self.lower_bound) / self.interval).long().reshape(-1, 3)
-        # SDK 2.1.6 cannot lower GreaterOrEqual/And/Not. Integer i>=0
-        # equals i>-1; multiply exact 0/1 masks instead of logical reductions.
-        vx, vy, vz = voxels[:, 0], voxels[:, 1], voxels[:, 2]
-        valid = ((vx > -1).to(feat.dtype) * (vx < self.width).to(feat.dtype)
-                 * (vy > -1).to(feat.dtype) * (vy < self.height).to(feat.dtype)
-                 * (vz > -1).to(feat.dtype) * (vz < 1).to(feat.dtype))
-        indices = voxels[:, 1] * self.width + voxels[:, 0]
-        # Invalid rays contribute zero to a safe index, including all-outside rigs.
-        indices = torch.where(valid > 0, indices, torch.zeros_like(indices)).reshape(-1, 1)
-        # Lift in [N*H*W,D,C], then restore N,D,H,W point ordering for pooling.
-        # Avoid the old rank-5 broadcast [N,D,H,W,1] * [N,1,H,W,C].
-        cameras, bins = depth.shape[:2]
-        pixels = depth.shape[2] * depth.shape[3]
-        probability = depth.reshape(cameras, bins, pixels).transpose(1, 2).reshape(-1, bins, 1)
-        values = probability * feat.reshape(-1, 1, self.channels)
-        values = values.reshape(cameras, pixels, bins, self.channels).permute(0, 2, 1, 3)
-        values = values.reshape(-1, self.channels)
-        values = values * valid.to(values.dtype).unsqueeze(-1)
-        bev = _ScatterSum.apply(self.empty_bev.to(values), indices, values)
-        return bev.reshape(1, self.height, self.width, self.channels).permute(0, 3, 1, 2).contiguous()
-
 
 class ExportOccHeadNCHW(torch.nn.Module):
     """Reuse trained OCC weights while keeping all features/logits in NCHW.
@@ -204,11 +119,10 @@ class ExportModel(torch.nn.Module):
         return self.decode_bev(self.pool(depth, feat))
 
 
-class RuntimeGeometryExportModel(ExportModel):
-    def forward(self, img, sensor2keyegos, intrins_inv, post_rots_inv, post_trans, bda):
+class RuntimeMappingExportModel(ExportModel):
+    def forward(self, img, *mapping):
         depth, feat = self.image_features(img)
-        return self.decode_bev(self.pool(depth, feat, sensor2keyegos, intrins_inv,
-                                         post_rots_inv, post_trans, bda))
+        return self.decode_bev(self.pool(depth, feat, *mapping))
 
 
 def main():
@@ -216,15 +130,23 @@ def main():
     # TODO 在此修改路径
     p.add_argument('--config', default='configs/bevdet/ep0_bevdet+flashocc/bevdet-r50-det-occ-shared-2gpu-32gb-pretrained.py')
     p.add_argument('--checkpoint', default='ckpt/epoch_20_ema.pth')
-    p.add_argument('--output', default='onnx/bev_occ_dynamic.onnx')
+    p.add_argument('--output', help='Defaults to onnx/bev_occ_mapping.onnx in mapping mode, otherwise onnx/bev_occ.onnx')
     p.add_argument('--device', choices=['cuda', 'cpu'], default='cuda', help='Device used for export; does not change ONNX inputs')
-    p.add_argument('--dynamic-geometry', action='store_true',
-                   help='Use runtime sensor2keyegos/intrins_inv/post_rots_inv/post_trans/bda inputs; requires ScatterND-add support')
-    p.add_argument('--sample-index', type=int, default=0, help='Sample for fixed geometry, or example runtime inputs in dynamic mode')
+    p.add_argument('--runtime-mapping', action='store_true', help='Use cached runtime pooling maps instead of geometry/scatter')
+    p.add_argument('--mapping-layout', help='Shared layout JSON from the original mapping export; required when updating maps')
+    p.add_argument('--mapping-only', action='store_true', help='Write input NPZ for new geometry without exporting/recompiling ONNX')
+    p.add_argument('--mapping-reserve', type=float, default=1.5, help='Bucket capacity multiplier when creating a shared layout')
+    p.add_argument('--sample-index', type=int, default=0, help='Sample used for fixed geometry or example cached maps')
     p.add_argument('--geometry-npz', help='Optional real-rig geometry: sensor2egos/ego2globals/intrins/post_rots/post_trans/bda, batch=1')
     args = p.parse_args()
+    if args.output is None:
+        args.output = 'onnx/bev_occ_mapping.onnx' if args.runtime_mapping else 'onnx/bev_occ.onnx'
     if args.sample_index < 0:
         p.error('sample-index must be nonnegative')
+    if args.mapping_layout and not args.runtime_mapping:
+        p.error('--mapping-layout requires --runtime-mapping')
+    if args.mapping_only and (not args.runtime_mapping or not args.mapping_layout):
+        p.error('--mapping-only requires --runtime-mapping and --mapping-layout')
     device = torch.device(args.device)
     if device.type == 'cuda':
         # PyTorch can use the CUDA runtime even when the optional NVML library
@@ -269,27 +191,38 @@ def main():
     with torch.no_grad():
         prepared = model.prepare_inputs(inputs)
         img = inputs[0].squeeze(0).float().contiguous()
-        if args.dynamic_geometry:
-            # sensor2keyegos includes the frame/pose alignment from prepare_inputs.
-            # Raw sensor2egos from six asynchronously captured images is NOT equivalent.
-            geometry_args = (prepared[1], prepared[3], prepared[4], prepared[5], prepared[6])
-            expected_shapes = [(1, img.shape[0], 4, 4), (1, img.shape[0], 3, 3),
-                               (1, img.shape[0], 3, 3), (1, img.shape[0], 3), (1, 4, 4)]
-            for tensor, shape in zip(geometry_args, expected_shapes):
-                if tuple(tensor.shape) != shape or not torch.isfinite(tensor).all():
-                    raise ValueError('Invalid runtime geometry shape/values: ' + str(tuple(tensor.shape)))
-            for matrix in (geometry_args[1], geometry_args[2]):
-                if (torch.linalg.det(matrix).abs() < 1e-10).any():
-                    raise ValueError('Runtime intrins/post_rots must be nonsingular')
-            # Invert in preprocessing with the same library as the original
-            # model. These inverses remain runtime inputs, never constants.
-            geometry_args = (geometry_args[0], torch.inverse(geometry_args[1]),
-                             torch.inverse(geometry_args[2]), geometry_args[3], geometry_args[4])
-            wrapper = RuntimeGeometryExportModel(model, RuntimeGeometryPool(
-                vt.frustum, vt.grid_lower_bound, vt.grid_interval, vt.grid_size,
-                vt.out_channels)).to(device).eval()
-            export_inputs = (img,) + geometry_args
-            input_names = ['img', 'sensor2keyegos', 'intrins_inv', 'post_rots_inv', 'post_trans', 'bda']
+        if args.runtime_mapping:
+            coor = vt.get_lidar_coor(*prepared[1:7])
+            if not torch.isfinite(coor).all():
+                raise ValueError('Mapping geometry produced nonfinite coordinates')
+            metas = vt.voxel_pooling_prepare_v2(coor)
+            if args.mapping_layout:
+                layout = json.loads(Path(args.mapping_layout).read_text())
+                if layout.get('version') != 2:
+                    raise ValueError('Expected mapping layout version 2')
+                if (layout['height'], layout['width'], layout['channels']) != (int(vt.grid_size[1]), int(vt.grid_size[0]), vt.out_channels):
+                    raise ValueError('Mapping layout does not match model grid/channels')
+                signature = dict(grid_lower_bound=vt.grid_lower_bound.cpu().tolist(),
+                                 grid_interval=vt.grid_interval.cpu().tolist(),
+                                 frustum_sha256=hashlib.sha256(vt.frustum.cpu().numpy().tobytes()).hexdigest(), frustum_shape=list(vt.frustum.shape), image_shape=list(img.shape))
+                if layout.get('signature') != signature:
+                    raise ValueError('Mapping layout grid/depth/image specification differs')
+            else:
+                layout = make_layout(metas, vt.grid_size, vt.out_channels, args.mapping_reserve)
+                layout['signature'] = dict(grid_lower_bound=vt.grid_lower_bound.cpu().tolist(),
+                    grid_interval=vt.grid_interval.cpu().tolist(), frustum_sha256=hashlib.sha256(vt.frustum.cpu().numpy().tobytes()).hexdigest(), frustum_shape=list(vt.frustum.shape),
+                    image_shape=list(img.shape))
+                output.with_suffix('.mapping.json').write_text(json.dumps(layout, indent=2))
+            mapping = make_mapping(metas, layout, device)
+            export_inputs = (img,) + mapping
+            input_names = ['img'] + mapping_names(layout)
+            if args.mapping_only:
+                path = output.with_suffix('.inputs.npz')
+                np.savez(path, **{name: tensor.detach().cpu().numpy() for name, tensor in zip(input_names, export_inputs)})
+                print('Updated mapping/example inputs:', path)
+                print('No ONNX was exported; use the existing compiled model and the same layout.')
+                return
+            wrapper = RuntimeMappingExportModel(model, RuntimeMappingPool(layout)).eval()
         else:
             coor = vt.get_lidar_coor(*prepared[1:7])
             metas = vt.voxel_pooling_prepare_v2(coor)
@@ -316,7 +249,7 @@ def main():
     graph = onnx.shape_inference.infer_shapes(graph, strict_mode=True)
     onnx.checker.check_model(graph, full_check=True)
     onnx.helper.set_model_props(graph, {
-        'geometry_mode': 'runtime' if args.dynamic_geometry else 'fixed',
+        'geometry_mode': 'mapping' if args.runtime_mapping else 'fixed',
         'geometry_frame': 'sensor2keyegos maps each camera sensor to the reference key ego frame',
         'occ_layout': 'NCHW; channel=z*num_classes+class'})
     graph.graph.output[-1].doc_string = (
@@ -327,13 +260,15 @@ def main():
         raise ValueError('Unexpected custom ONNX operator')
     print('Exported:', output)
     print('OCC output: NCHW [B,Dz*num_classes,Y,X], channel=z*num_classes+class')
-    if args.dynamic_geometry:
+    if args.runtime_mapping:
         example_path = output.with_suffix('.inputs.npz')
         np.savez(example_path, **{name: tensor.detach().cpu().numpy()
                                  for name, tensor in zip(input_names, export_inputs)})
-        print('Runtime geometry inputs:', input_names)
+        print('Cached mapping inputs:', input_names)
         print('Example inputs:', example_path)
-        print('Requires ONNX ScatterND reduction=add; OMG compatibility must be checked.')
+        print('Mapping inputs: FP32 base-1024 components and masks; preserve mapping precision in SDK quant_tensors.')
+        print('Layout:', args.mapping_layout or output.with_suffix('.mapping.json'))
+        print('Runtime Gather performance and quantized accuracy must be checked on the SDK.')
     else:
         print('Fixed geometry:', args.geometry_npz or f'validation sample {args.sample_index}')
     for name, tensor in zip(names, outputs):
