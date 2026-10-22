@@ -1,5 +1,13 @@
 #!/usr/bin/env bash
 
+# Bound CPU threads per process for multi-GPU/data-loader workloads.
+# AutoDL images may export OMP/MKL=64 globally. Override deliberately here.
+# Tune explicitly with TRAIN_NUM_THREADS=2 (or 4) after benchmarking.
+export OMP_NUM_THREADS=${TRAIN_NUM_THREADS:-1}
+export MKL_NUM_THREADS=${TRAIN_NUM_THREADS:-1}
+export OPENBLAS_NUM_THREADS=${TRAIN_NUM_THREADS:-1}
+export NUMEXPR_NUM_THREADS=${TRAIN_NUM_THREADS:-1}
+
 CONFIG=$1
 GPUS=$2
 NNODES=${NNODES:-1}

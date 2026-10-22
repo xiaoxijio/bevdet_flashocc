@@ -1,8 +1,9 @@
 # EP1：共享 BEVDet + FlashOCC 轻量化实验
 
 在 3090 的 `/home/fjm/tong/BEVDet` 根目录、`bevdet` 环境执行。
-四组是**累计结构改动**，但默认都从同一个 `ckpt/epoch_20_ema.pth` 初始化，
-分别训练，便于与原始模型和相邻组比较。没有自动启用教师蒸馏。
+四组是**累计结构改动**。当前AutoDL配置中G1从`ckpt/epoch_20_ema.pth`初始化，
+G2/G3/G4从G1的`work_dirs/ep1_g1_occ128/epoch_20_ema.pth`初始化，
+且G2/G3/G4增加深度监督（见文末）。没有自动启用教师蒸馏。
 
 | 组 | 配置文件 | 相比上一组新增改动 |
 |---|---|---|
@@ -33,7 +34,7 @@ G2只是把OCC的主要3×3卷积移到粗网格；MLP仍然在200×200上运行
 
 ## 初始化和训练
 
-默认`load_from='ckpt/epoch_20_ema.pth'`，`resume_from=None`。
+G1的`load_from='ckpt/epoch_20_ema.pth'`；G2/G3/G4继承G2指定的G1权重，`resume_from=None`。
 MMCV使用非严格初始化：加载名称及shape相同的参数，报告并跳过形状变化/缺失参数；
 新层按初始化值开始训练。G4的新backbone先加载ImageNet权重，再由load_from恢复其他匹配层。
 因此启动时的shape mismatch / missing / unexpected key提示是预期的初始化提示，
@@ -114,3 +115,27 @@ python -m pytest -q \
 
 建议每组仍使用独立的`--out-dir`；日常直接查看对应目录的`metrics.txt`即可，
 不需要重跑验证或依赖终端记录。mAP/NDS使用0–1数值，OCC IoU/mIoU使用百分数。
+
+
+## G2/G3/G4 深度监督（AutoDL）
+
+G1保持原检测+OCC监督；G2显式启用`model.depth_loss_weight=1.0`，G3/G4继承。
+使用原LSS深度概率和BEVDepth的最近有效点下采样、离散分箱、BCE监督规则，
+深度范围仍为[1,60)米、步长1米；没有更换DepthNet或新增网络参数。
+总损失 = 检测损失 + occ_loss_weight * OCC损失 + depth_loss_weight * 深度BCE。
+LiDAR仅在训练时生成六路图像的稀疏深度标签；推理/导出仍是纯相机输入。
+当前G2的`load_from`保留为`./work_dirs/ep1_g1_occ128/epoch_20_ema.pth`，
+G3/G4也继承此初始化来源；若需逐组微调，请显式指定各自上一组权重。
+先确认G1该权重已生成，再运行G2。四卡/每卡2样本、学习率和20 epoch不变。
+
+```bash
+bash tools/dist_train.sh \
+  'configs/bevdet/ep1_bevdet+flashocc/bevdet-r50-det-occ-g2-occ08.py' \
+  4 --validate
+```
+
+训练日志应出现`loss_depth`。权重1.0是初始实验设置，需结合检测/OCC验证指标调整。
+G1到G2同时改变OCC卷积网格和监督，不能把指标变化全部归因于结构变化。
+需要无深度监督对照时可加`--cfg-options model.depth_loss_weight=0`；
+此时仍有生成标签的开销，但深度损失关闭。新增深度标签读取/计算会增加训练开销。
+不使用`with_depth_from_lidar=True`，不把LiDAR作为推理输入。
