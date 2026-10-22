@@ -82,3 +82,42 @@ def test_encoded_large_indices_survive_fp16():
     np.testing.assert_array_equal(decode_indices(encoded).numpy(), indices)
     with pytest.raises(ValueError, match='capacity'):
         encode_indices(np.array([1048576]))
+
+
+def test_zero_depth_padding_removes_masks_without_changing_groups(tmp_path):
+    from tools.bev_occ_mapping import decode_indices
+    vt, _, inputs = fixture()
+    meta = metadata(vt, inputs)
+    layout = make_layout(meta, vt.grid_size, 3, reserve=4)
+    mapping = make_mapping(meta, layout)
+    assert layout['version'] == 3
+    assert layout['padding'] == 'zero_depth_prefix'
+    assert len(mapping) == 2 * len(layout['groups']) + 1
+    assert not any('mask' in name for name in mapping_names(layout))
+    # A nonzero first depth makes accidental use of padding index zero visible.
+    depth = inputs[0].clone()
+    depth.reshape(-1)[0] = 7.
+    padded = 0
+    for i, group in enumerate(layout['groups']):
+        ranks = decode_indices(mapping[2*i])
+        padded += int((ranks == 0).sum())
+        assert ranks.max() <= depth.numel()
+    assert padded > 0
+    pool = RuntimeMappingPool(layout)
+    torch.testing.assert_close(pool(depth, inputs[1], *mapping), native_reference(vt, (depth, *inputs[1:])))
+    path = tmp_path / 'no_mask.onnx'
+    torch.onnx.export(pool, (depth, inputs[1], *mapping), str(path), input_names=['depth','feat'] + mapping_names(layout), opset_version=16)
+    graph = onnx.load(path)
+    # Per group: two index-recovery Mul and one depth-feature Mul; no mask Mul.
+    assert sum(n.op_type == 'Mul' for n in graph.graph.node) == 3 * len(layout['groups']) + 1
+
+
+def test_invalid_layout_version_is_rejected():
+    vt, _, inputs = fixture()
+    meta = metadata(vt, inputs)
+    layout = make_layout(meta, vt.grid_size, 3)
+    layout['version'] = -1
+    with pytest.raises(ValueError, match='version 3'):
+        make_mapping(meta, layout)
+    with pytest.raises(ValueError, match='version 3'):
+        RuntimeMappingPool(layout)

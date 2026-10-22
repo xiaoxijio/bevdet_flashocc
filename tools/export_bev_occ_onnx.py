@@ -198,8 +198,8 @@ def main():
             metas = vt.voxel_pooling_prepare_v2(coor)
             if args.mapping_layout:
                 layout = json.loads(Path(args.mapping_layout).read_text())
-                if layout.get('version') != 2:
-                    raise ValueError('Expected mapping layout version 2')
+                if layout.get('version') != 3 or layout.get('padding') != 'zero_depth_prefix':
+                    raise ValueError('Expected zero-depth mapping layout version 3; regenerate layout and maps')
                 if (layout['height'], layout['width'], layout['channels']) != (int(vt.grid_size[1]), int(vt.grid_size[0]), vt.out_channels):
                     raise ValueError('Mapping layout does not match model grid/channels')
                 signature = dict(grid_lower_bound=vt.grid_lower_bound.cpu().tolist(),
@@ -218,7 +218,7 @@ def main():
             input_names = ['img'] + mapping_names(layout)
             if args.mapping_only:
                 path = output.with_suffix('.inputs.npz')
-                np.savez(path, **{name: tensor.detach().cpu().numpy() for name, tensor in zip(input_names, export_inputs)})
+                np.savez(path, mapping_version=np.array(3, dtype=np.int32), **{name: tensor.detach().cpu().numpy() for name, tensor in zip(input_names, export_inputs)})
                 print('Updated mapping/example inputs:', path)
                 print('No ONNX was exported; use the existing compiled model and the same layout.')
                 return
@@ -250,6 +250,7 @@ def main():
     onnx.checker.check_model(graph, full_check=True)
     onnx.helper.set_model_props(graph, {
         'geometry_mode': 'mapping' if args.runtime_mapping else 'fixed',
+        'mapping_version': '3' if args.runtime_mapping else 'none',
         'geometry_frame': 'sensor2keyegos maps each camera sensor to the reference key ego frame',
         'occ_layout': 'NCHW; channel=z*num_classes+class'})
     graph.graph.output[-1].doc_string = (
@@ -262,11 +263,11 @@ def main():
     print('OCC output: NCHW [B,Dz*num_classes,Y,X], channel=z*num_classes+class')
     if args.runtime_mapping:
         example_path = output.with_suffix('.inputs.npz')
-        np.savez(example_path, **{name: tensor.detach().cpu().numpy()
+        np.savez(example_path, mapping_version=np.array(3, dtype=np.int32), **{name: tensor.detach().cpu().numpy()
                                  for name, tensor in zip(input_names, export_inputs)})
         print('Cached mapping inputs:', input_names)
         print('Example inputs:', example_path)
-        print('Mapping inputs: FP32 base-1024 components and masks; preserve mapping precision in SDK quant_tensors.')
+        print('Mapping inputs: FP32 base-1024 indices, zero-depth padding, no masks; preserve mapping precision in SDK quant_tensors.')
         print('Layout:', args.mapping_layout or output.with_suffix('.mapping.json'))
         print('Runtime Gather performance and quantized accuracy must be checked on the SDK.')
     else:

@@ -19,7 +19,7 @@ def make_layout(metas, grid_size, channels, reserve=1.5):
             raise ValueError('Mapping bucket dimension exceeds SDK limit; use a smaller reserve or a tiled layout')
         groups.append(dict(bound=bound, count=capacity))
         bound *= 2
-    return dict(version=2, index_encoding='base1024_fp16_safe', height=int(grid_size[1]), width=int(grid_size[0]),
+    return dict(version=3, padding='zero_depth_prefix', index_encoding='base1024_fp16_safe', height=int(grid_size[1]), width=int(grid_size[0]),
                 channels=int(channels), groups=groups)
 
 
@@ -40,6 +40,8 @@ def decode_indices(packed):
 
 
 def make_mapping(metas, layout, device='cpu'):
+    if layout.get('version') != 3 or layout.get('padding') != 'zero_depth_prefix':
+        raise ValueError('Expected zero-depth mapping layout version 3; regenerate maps')
     h, w = layout['height'], layout['width']
     lookup = np.zeros(h * w, dtype=np.int32)
     result = []
@@ -57,19 +59,16 @@ def make_mapping(metas, layout, device='cpu'):
             raise ValueError(f'Mapping bucket {bound} needs {len(ids)} slots, compiled capacity is {count}; no points were truncated')
         di = np.zeros((count, bound), dtype=np.int32)
         fi = np.zeros_like(di)
-        mask = np.zeros((count, bound, 1), dtype=np.float32)
         for slot, index in enumerate(ids):
             start, length = starts[index], lengths[index]
-            di[slot, :length] = rd[start:start + length]
+            di[slot, :length] = rd[start:start + length] + 1
             fi[slot, :length] = rf[start:start + length]
-            mask[slot, :length, 0] = 1
             voxel = int(rb[start])
             if not 0 <= voxel < h * w:
                 raise ValueError('BEV index outside shared layout')
             lookup[voxel] = offset + slot
         result.extend([torch.from_numpy(encode_indices(di)).to(device),
-                       torch.from_numpy(encode_indices(fi)).to(device),
-                       torch.from_numpy(mask).to(device)])
+                       torch.from_numpy(encode_indices(fi)).to(device)])
         offset += count
     result.append(torch.from_numpy(encode_indices(lookup)).to(device))
     return tuple(result)
@@ -78,25 +77,28 @@ def make_mapping(metas, layout, device='cpu'):
 def mapping_names(layout):
     names = []
     for group in layout['groups']:
-        names.extend(f'{kind}_{group["bound"]}' for kind in ('ranks_depth', 'ranks_feat', 'pool_mask'))
+        names.extend(f'{kind}_{group["bound"]}' for kind in ('ranks_depth', 'ranks_feat'))
     return names + ['bev_slots']
 
 
 class RuntimeMappingPool(torch.nn.Module):
     def __init__(self, layout):
         super().__init__()
+        if layout.get('version') != 3 or layout.get('padding') != 'zero_depth_prefix':
+            raise ValueError('Expected zero-depth mapping layout version 3; regenerate maps')
         self.layout = layout
         self.channels = layout['channels']
 
     def forward(self, depth, feat, *mapping):
-        depth = depth.reshape(-1, 1)
+        # Index 0 is exactly zero; valid ranks are shifted by one offline.
+        depth = torch.cat((depth.new_zeros((1, 1)), depth.reshape(-1, 1)), dim=0)
         feat = feat.reshape(-1, self.channels)
         sums = [feat.new_zeros((1, self.channels))]
         for i, group in enumerate(self.layout['groups']):
-            rd, rf, mask = mapping[3*i:3*i+3]
+            rd, rf = mapping[2*i:2*i+2]
             rd, rf = decode_indices(rd), decode_indices(rf)
             values = torch.index_select(depth, 0, rd) * torch.index_select(feat, 0, rf)
-            values = values.reshape(group['count'], group['bound'], self.channels) * mask
+            values = values.reshape(group['count'], group['bound'], self.channels)
             sums.append(values.sum(1).reshape(group['count'], self.channels))
         bev = torch.index_select(torch.cat(sums, 0), 0, decode_indices(mapping[-1]))
         return bev.reshape(1, self.layout['height'], self.layout['width'], self.channels).permute(0, 3, 1, 2).contiguous()
