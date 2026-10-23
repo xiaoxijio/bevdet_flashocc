@@ -2,7 +2,7 @@
 # Upsample features, then predict at 0.4 m; GT/masks/range/Dz are unchanged.
 _base_ = ['./bevdet-r50-det-occ-g1-occ128.py']
 model = dict(
-    depth_loss_weight=1.0,
+    depth_loss_weight=0.1,
     occ_adapter=dict(dst_grid=[-40., 40., .8]),
     occ_head=dict(feature_upsample_scale=2, feature_align_corners=False))
 load_from = './work_dirs/ep1_g1_occ128/epoch_20_ema.pth'

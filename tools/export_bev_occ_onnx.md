@@ -96,14 +96,13 @@ SDK 输入配置不支持直接使用 I32 二进制输入，因此采用上述�
 然后进入 `npu_toolchain/common/samples/app/tda4/mod/bev_occ/`，激活 `sdk` 环境执行：
 
 ```bash
-bash 00_init.sh bev_occ_mapping
-python prepare_mapping_calibration.py \
-  --npz ../../../../data/model/bev_occ/bev_occ_mapping.inputs.npz
-bash 01_check.sh bev_occ_mapping --config input_cfg_mapping.yml
-bash 03_omg.sh bev_occ_mapping --config input_cfg_mapping.yml
+bash 00_init.sh g1
+python prepare_mapping_calibration.py   --onnx ../../../../data/model/bev_occ/g1.onnx   --npz ../../../../data/model/bev_occ/g1.inputs.npz   --out-dir calibration_g1   --config input_cfg_g1.yml
+bash 01_check.sh g1 --config input_cfg_g1.yml
+bash 03_omg.sh g1 --config input_cfg_g1.yml
 # 仿真程序尚未构建，或 build_sim 已删除时执行
 bash 04_build.sh
-bash 05_inference.sh --model-name bev_occ_mapping --mode perf --tag mapping_epoch20
+bash 05_inference.sh --model-name g1 --tag g1
 ```
 
 准备脚本仅接受版本 3 的模型和映射，NPZ 字段必须与模型输入及版本标记完全匹配。

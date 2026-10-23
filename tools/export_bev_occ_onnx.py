@@ -128,14 +128,14 @@ class RuntimeMappingExportModel(ExportModel):
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     # TODO 在此修改路径
-    p.add_argument('--config', default='configs/bevdet/ep0_bevdet+flashocc/bevdet-r50-det-occ-shared-2gpu-32gb-pretrained.py')
-    p.add_argument('--checkpoint', default='ckpt/epoch_20_ema.pth')
+    p.add_argument('--config', default='configs/bevdet/ep1_bevdet+flashocc/bevdet-r50-det-occ-g1-occ128.py')
+    p.add_argument('--checkpoint', default='ckpt/g1.pth')
     p.add_argument('--output', help='Defaults to onnx/bev_occ_mapping.onnx in mapping mode, otherwise onnx/bev_occ.onnx')
     p.add_argument('--device', choices=['cuda', 'cpu'], default='cuda', help='Device used for export; does not change ONNX inputs')
     p.add_argument('--runtime-mapping', action='store_true', help='Use cached runtime pooling maps instead of geometry/scatter')
     p.add_argument('--mapping-layout', help='Shared layout JSON from the original mapping export; required when updating maps')
     p.add_argument('--mapping-only', action='store_true', help='Write input NPZ for new geometry without exporting/recompiling ONNX')
-    p.add_argument('--mapping-reserve', type=float, default=1.5, help='Bucket capacity multiplier when creating a shared layout')
+    p.add_argument('--mapping-reserve', type=float, default=1.1, help='Bucket capacity multiplier when creating a shared layout')
     p.add_argument('--sample-index', type=int, default=0, help='Sample used for fixed geometry or example cached maps')
     p.add_argument('--geometry-npz', help='Optional real-rig geometry: sensor2egos/ego2globals/intrins/post_rots/post_trans/bda, batch=1')
     args = p.parse_args()
