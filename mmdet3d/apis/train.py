@@ -218,6 +218,10 @@ def train_detector(model,
         for ds in dataset
     ]
 
+    if cfg.get('qat', {}).get('enabled', False):
+        from mmdet3d.utils.oritek_qat import prepare_training
+        model = prepare_training(model, data_loaders[0], cfg, logger)
+
     # put model on gpus
     if distributed:
         find_unused_parameters = cfg.get('find_unused_parameters', False)
@@ -277,6 +281,10 @@ def train_detector(model,
         cfg.log_config,
         cfg.get('momentum_config', None),
         custom_hooks_config=cfg.get('custom_hooks', None))
+
+    if cfg.get('qat', {}).get('enabled', False):
+        from mmdet3d.utils.oritek_qat import OritekQATHook
+        runner.register_hook(OritekQATHook(cfg.qat), priority='NORMAL')
 
     if distributed:
         if isinstance(runner, EpochBasedRunner):

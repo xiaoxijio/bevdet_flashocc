@@ -44,6 +44,7 @@ class BEVOCCHead2D(BaseModule):
                  loss_occ=None,
                  feature_upsample_scale=1,
                  feature_align_corners=False,
+                 use_conv_predicter=False,
                  ):
         super(BEVOCCHead2D, self).__init__()
         if isinstance(feature_upsample_scale, bool) or not isinstance(feature_upsample_scale, int) or feature_upsample_scale < 1:
@@ -66,12 +67,18 @@ class BEVOCCHead2D(BaseModule):
             conv_cfg=dict(type='Conv2d')
         )
         self.use_predicter = use_predicter
+        self.use_conv_predicter = use_conv_predicter
         if use_predicter:
-            self.predicter = nn.Sequential(
-                nn.Linear(self.out_dim, self.out_dim * 2),
-                nn.Softplus(),
-                nn.Linear(self.out_dim * 2, num_classes * Dz),
-            )
+            if self.use_conv_predicter:
+                self.predicter = nn.Sequential(
+                    nn.Conv2d(self.out_dim, self.out_dim * 2, 1),
+                    nn.Softplus(),
+                    nn.Conv2d(self.out_dim * 2, num_classes * Dz, 1))
+            else:
+                self.predicter = nn.Sequential(
+                    nn.Linear(self.out_dim, self.out_dim * 2),
+                    nn.Softplus(),
+                    nn.Linear(self.out_dim * 2, num_classes * Dz))
 
         self.use_mask = use_mask
         self.num_classes = num_classes
@@ -83,30 +90,44 @@ class BEVOCCHead2D(BaseModule):
             loss_occ['class_weight'] = class_weights        # ce loss
         self.loss_occ = build_loss(loss_occ)
 
-    def forward(self, img_feats):
-        """
-        Args:
-            img_feats: (B, C, Dy, Dx)
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata,
+                              strict, missing_keys, unexpected_keys, error_msgs):
+        # Old FP Linear checkpoints are equivalent to pointwise convolutions.
+        if self.use_conv_predicter and self.use_predicter:
+            for index in (0, 2):
+                key = prefix + f'predicter.{index}.weight'
+                if key in state_dict and state_dict[key].ndim == 2:
+                    state_dict[key] = state_dict[key][:, :, None, None]
+        super()._load_from_state_dict(state_dict, prefix, local_metadata,
+                                     strict, missing_keys, unexpected_keys, error_msgs)
 
-        Returns:
-
-        """
-        # (B, C, Dy, Dx) --> (B, C, Dy, Dx) --> (B, Dx, Dy, C)
-        # Heavy 3x3 convolution runs on the coarse grid. Restore feature
-        # resolution before the per-position predictor and the original loss.
+    def forward_nchw(self, img_feats):
+        """Shared training/export path; channel = z * num_classes + class."""
         features = self.final_conv(img_feats)
         if self.feature_upsample_scale != 1:
-            features = F.interpolate(features,
-                scale_factor=self.feature_upsample_scale, mode='bilinear',
-                align_corners=self.feature_align_corners)
-        occ_pred = features.permute(0, 3, 2, 1)
-        bs, Dx, Dy = occ_pred.shape[:3]
+            features = F.interpolate(
+                features, scale_factor=self.feature_upsample_scale,
+                mode='bilinear', align_corners=self.feature_align_corners)
         if self.use_predicter:
-            # (B, Dx, Dy, C) --> (B, Dx, Dy, 2*C) --> (B, Dx, Dy, Dz*n_cls)
-            occ_pred = self.predicter(occ_pred)
-        occ_pred = occ_pred.reshape(bs, Dx, Dy, self.Dz, self.num_classes)
+            if not self.use_conv_predicter:
+                raise ValueError('forward_nchw requires use_conv_predicter=True')
+            features = self.predicter(features)
+        return features
 
-        return occ_pred
+    def forward(self, img_feats):
+        if self.use_conv_predicter or not self.use_predicter:
+            raw = self.forward_nchw(img_feats)
+            bs, _, dy, dx = raw.shape
+            return raw.reshape(bs, self.Dz, self.num_classes, dy, dx).permute(0, 4, 3, 1, 2)
+        # Preserve the existing FP experiments and their checkpoint layout.
+        features = self.final_conv(img_feats)
+        if self.feature_upsample_scale != 1:
+            features = F.interpolate(
+                features, scale_factor=self.feature_upsample_scale,
+                mode='bilinear', align_corners=self.feature_align_corners)
+        occ_pred = self.predicter(features.permute(0, 3, 2, 1))
+        bs, dx, dy = occ_pred.shape[:3]
+        return occ_pred.reshape(bs, dx, dy, self.Dz, self.num_classes)
 
     def loss(self, occ_pred, voxel_semantics, mask_camera):
         """

@@ -68,7 +68,7 @@ class ExportOccHeadNCHW(torch.nn.Module):
     def __init__(self, head):
         super().__init__()
         self.head = head
-        if head.use_predicter:
+        if head.use_predicter and not getattr(head, 'use_conv_predicter', False):
             predictor = head.predicter
             if (not isinstance(predictor, torch.nn.Sequential) or len(predictor) != 3
                     or not isinstance(predictor[0], torch.nn.Linear)
@@ -79,6 +79,8 @@ class ExportOccHeadNCHW(torch.nn.Module):
 
     def forward(self, features):
         head = self.head
+        if getattr(head, 'use_conv_predicter', False):
+            return head.forward_nchw(features)
         features = head.final_conv(features)
         scale = getattr(head, 'feature_upsample_scale', 1)
         if scale != 1:
@@ -115,12 +117,17 @@ class ExportModel(torch.nn.Module):
         det = m.pts_bbox_head([bev])
         return tuple([task[0][key] for task in det for key in KEYS] + [self.occ_export(m.occ_adapter(bev))])
     def forward(self, img):
+        # SDK 2.1.6 first calls model(args), then model(*args).
+        if isinstance(img, tuple):
+            img, = img
         depth, feat = self.image_features(img)
         return self.decode_bev(self.pool(depth, feat))
 
 
 class RuntimeMappingExportModel(ExportModel):
     def forward(self, img, *mapping):
+        if isinstance(img, tuple) and not mapping:
+            img, *mapping = img
         depth, feat = self.image_features(img)
         return self.decode_bev(self.pool(depth, feat, *mapping))
 
@@ -128,10 +135,11 @@ class RuntimeMappingExportModel(ExportModel):
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     # TODO 在此修改路径
-    p.add_argument('--config', default='configs/bevdet/ep1_bevdet+flashocc/bevdet-r50-det-occ-g1-occ128.py')
-    p.add_argument('--checkpoint', default='ckpt/g1.pth')
+    p.add_argument('--config', default='configs/bevdet/ep1_bevdet+flashocc/bevdet-b0-det-occ-g4-nose.py')
+    p.add_argument('--checkpoint', default='work_dirs/ep1_g4_b0_nose_stable/epoch_20_ema.pth')
     p.add_argument('--output', help='Defaults to onnx/bev_occ_mapping.onnx in mapping mode, otherwise onnx/bev_occ.onnx')
     p.add_argument('--device', choices=['cuda', 'cpu'], default='cuda', help='Device used for export; does not change ONNX inputs')
+    p.add_argument('--qat', action='store_true', help='Restore this project QAT checkpoint and use SDK export')
     p.add_argument('--runtime-mapping', action='store_true', help='Use cached runtime pooling maps instead of geometry/scatter')
     p.add_argument('--mapping-layout', help='Shared layout JSON from the original mapping export; required when updating maps')
     p.add_argument('--mapping-only', action='store_true', help='Write input NPZ for new geometry without exporting/recompiling ONNX')
@@ -168,7 +176,15 @@ def main():
     model = build_model(cfg.model, test_cfg=cfg.get('test_cfg'))
     checkpoint = torch.load(args.checkpoint, map_location='cpu')
     state = checkpoint.get('state_dict', checkpoint)
-    model.load_state_dict({k[7:] if k.startswith('module.') else k: v for k, v in state.items()}, strict=True)
+    if args.qat:
+        from mmdet3d.utils.oritek_qat import convert_convolutions, validate_recipe
+        if not cfg.get('qat', {}).get('enabled', False):
+            p.error('--qat requires a QAT-enabled config')
+        validate_recipe(checkpoint, cfg.qat)
+    else:
+        if 'oritek_qat' in checkpoint.get('meta', {}):
+            p.error('This is a QAT checkpoint; pass --qat and the matching config')
+        model.load_state_dict({k[7:] if k.startswith('module.') else k: v for k, v in state.items()}, strict=True)
     model.to(device).eval()
     vt = model.img_view_transformer
     if int(vt.grid_size[2]) != 1:
@@ -230,6 +246,16 @@ def main():
                 raise ValueError('Camera geometry projects no valid points into BEV')
             wrapper = ExportModel(model, FixedPool(metas, vt.grid_size, vt.out_channels)).eval()
             export_inputs, input_names = (img,), ['img']
+        if args.qat:
+            if args.mapping_only:
+                p.error('--qat does not apply to --mapping-only')
+            # Rebuild exactly the training graph and buffer shapes. Calibration
+            # only materializes state; strict loading then restores trained scales.
+            model = convert_convolutions(model, cfg.qat, lambda: wrapper(*export_inputs))
+            model.load_state_dict(state, strict=True)
+            wrapper.to(device).eval()
+            from oritek_qat import quantize_tool
+            quantize_tool.disable_observer(model)
         outputs = wrapper(*export_inputs)
         if not all(torch.isfinite(t).all() for t in outputs):
             raise ValueError('Nonfinite model output')
@@ -243,12 +269,14 @@ def main():
                 category=UserWarning,
                 module=r'torch\.onnx(\..*)?',
             )
-            torch.onnx.export(wrapper, export_inputs, str(output), opset_version=16,
-                              input_names=input_names, output_names=names)
+            export = quantize_tool.export_onnx if args.qat else torch.onnx.export
+            export(wrapper, export_inputs, str(output), opset_version=16,
+                   input_names=input_names, output_names=names)
     graph = onnx.load(str(output))
     graph = onnx.shape_inference.infer_shapes(graph, strict_mode=True)
     onnx.checker.check_model(graph, full_check=True)
     onnx.helper.set_model_props(graph, {
+        'quantization': 'oritek_qat_int8_conv_islands' if args.qat else 'floating_point',
         'geometry_mode': 'mapping' if args.runtime_mapping else 'fixed',
         'mapping_version': '3' if args.runtime_mapping else 'none',
         'geometry_frame': 'sensor2keyegos maps each camera sensor to the reference key ego frame',
