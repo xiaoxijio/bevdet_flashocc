@@ -121,6 +121,7 @@ mmdet3d/.mim
 
 # Pytorch
 *.pth
+*.onnx
 onnx/
 
 # demo
