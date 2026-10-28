@@ -176,7 +176,7 @@ class OritekQATHook(Hook):
         runner.meta['oritek_qat'] = dict(
             format_version=FORMAT_VERSION, recipe=self.recipe,
             sdk_version=version('oritek-qat-pytorch'))
-        self._sync(runner.model.module)
+        self._sync(runner.model.module, self.recipe.get('coalesced_sync', False))
         runner.logger.info('QAT active: %s', self.recipe)
 
     def before_train_iter(self, runner):
@@ -186,13 +186,20 @@ class OritekQATHook(Hook):
             freeze_bn(model)
 
     @staticmethod
-    def _sync(model):
+    def _sync(model, coalesced=False):
         # Keep collector buffers consistent at iteration boundaries across ranks;
         # checkpoint rank 0's scales and min/max, never EMA-average these values.
         if torch.distributed.is_available() and torch.distributed.is_initialized():
-            for name, tensor in model.state_dict().items():
-                if ('quantizer' in name or name == '_qat_format_version'):
+            tensors = [tensor for name, tensor in model.state_dict().items()
+                       if 'quantizer' in name or name == '_qat_format_version']
+            if coalesced and tensors:
+                # Same rank-0 values and iteration boundaries; bucket small
+                # collector buffers to avoid hundreds of tiny NCCL launches.
+                torch.distributed._broadcast_coalesced(
+                    torch.distributed.group.WORLD, tensors, 1024 * 1024, 0)
+            else:
+                for tensor in tensors:
                     torch.distributed.broadcast(tensor, src=0)
 
     def after_train_iter(self, runner):
-        self._sync(runner.model.module)
+        self._sync(runner.model.module, self.recipe.get('coalesced_sync', False))
