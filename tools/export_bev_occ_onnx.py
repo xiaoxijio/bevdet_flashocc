@@ -1,4 +1,7 @@
-"""Export joint Det/OCC with fixed geometry or cached maps; NCHW OCC logits."""
+"""Export joint Det/OCC with fixed geometry or cached maps; NCHW OCC logits.
+
+Fixed geometry uses composed indices, zero-depth padding and power-of-two groups.
+"""
 import argparse
 import json
 import hashlib
@@ -20,43 +23,60 @@ from tools.bev_occ_mapping import RuntimeMappingPool, make_layout, make_mapping,
 KEYS = ['reg', 'height', 'dim', 'rot', 'vel', 'heatmap']
 
 class FixedPool(torch.nn.Module):
-    """Sum each voxel directly; avoid OMG's dense CumSum-to-MatMul expansion."""
+    """Compose constant indices before export; never materialize all point features.
+
+    Each bucket gathers depth/features directly in reduction order. Invalid slots
+    reference an exact zero depth prefix, replacing the legacy mask multiply.
+    """
     def __init__(self, metas, grid_size, channels):
         super().__init__()
         rb, rd, rf, starts, lengths = metas
+        if not lengths.numel() or bool((lengths <= 0).any()):
+            raise ValueError('Pool needs nonempty positive lengths')
         self.height, self.width = int(grid_size[1]), int(grid_size[0])
         self.channels = channels
-        self.register_buffer('rd', rd.long())
-        self.register_buffer('rf', rf.long())
         self.groups = []
         ordered_bev = []
         max_length = int(lengths.max().item())
-        bound = 1
-        while bound < 2 * max_length:
-            ids = torch.where((lengths <= bound) & (lengths > (bound // 2 if bound > 1 else 0)))[0]
-            if ids.numel():
-                offsets = torch.arange(bound, device=starts.device)[None, :]
-                valid = offsets < lengths[ids, None]
-                indices = torch.where(valid, starts[ids, None] + offsets, 0).long()
-                self.register_buffer(f'indices_{bound}', indices.reshape(-1))
-                self.register_buffer(f'mask_{bound}', valid[:, :, None].float())
-                self.groups.append((bound, int(ids.numel())))
-                ordered_bev.append(rb[starts[ids].long()])
-            bound *= 2
+        bounds = [1 << i for i in range((max_length - 1).bit_length() + 1)]
+        previous = 0
+        for bound in bounds:
+            ids = torch.where((lengths > previous) & (lengths <= bound))[0]
+            previous = bound
+            if not ids.numel():
+                continue
+            offsets = torch.arange(bound, device=starts.device)[None, :]
+            valid = offsets < lengths[ids, None]
+            source = torch.where(valid, starts[ids, None] + offsets, 0).long()
+            depth_indices = torch.where(valid, rd.long()[source] + 1, 0)
+            feature_indices = torch.where(valid, rf.long()[source], 0)
+            self.register_buffer(f'rd_{bound}', depth_indices.reshape(-1).long())
+            self.register_buffer(f'rf_{bound}', feature_indices.reshape(-1).long())
+            self.groups.append((bound, int(ids.numel())))
+            ordered_bev.append(rb[starts[ids].long()])
         self.register_buffer('bev_indices', torch.cat(ordered_bev).long())
+        self.valid_points = int(lengths.sum().item())
+        self.padded_points = sum(bound * count for bound, count in self.groups)
 
     def forward(self, depth, feat):
-        values = depth.reshape(-1, 1)[self.rd] * feat.reshape(-1, self.channels)[self.rf]
+        depth = torch.cat((depth.new_zeros((1, 1)), depth.reshape(-1, 1)), dim=0)
+        feat = feat.reshape(-1, self.channels)
         groups = []
         for bound, count in self.groups:
-            x = values[getattr(self, f'indices_{bound}')].reshape(count, bound, self.channels)
-            x = x * getattr(self, f'mask_{bound}')
-            # Explicit reshape is required by OMG's ReduceSum shape inference.
-            groups.append(x.sum(dim=1).reshape(count, self.channels))
-        sums = torch.cat(groups, dim=0)
+            d = depth[getattr(self, f'rd_{bound}')]
+            f = feat[getattr(self, f'rf_{bound}')]
+            x = d * f
+            if count == 1:
+                # SDK 2.1.6 mis-infers ReduceSum(axis=1) on [1,K,C].
+                # Reduce the existing [K,C] tensor along axis 0 instead.
+                groups.append(x.sum(dim=0, keepdim=True).reshape(1, self.channels))
+            else:
+                x = x.reshape(count, bound, self.channels)
+                groups.append(x.sum(dim=1).reshape(count, self.channels))
         bev = feat.new_zeros((self.height * self.width, self.channels))
-        bev[self.bev_indices] = sums
+        bev[self.bev_indices] = torch.cat(groups, dim=0)
         return bev.reshape(1, self.height, self.width, self.channels).permute(0, 3, 1, 2).contiguous()
+
 
 class ExportOccHeadNCHW(torch.nn.Module):
     """Reuse trained OCC weights while keeping all features/logits in NCHW.
@@ -244,7 +264,10 @@ def main():
             metas = vt.voxel_pooling_prepare_v2(coor)
             if metas[0] is None:
                 raise ValueError('Camera geometry projects no valid points into BEV')
-            wrapper = ExportModel(model, FixedPool(metas, vt.grid_size, vt.out_channels)).eval()
+            pool = FixedPool(metas, vt.grid_size, vt.out_channels)
+            print('Optimized fixed pool:', len(pool.groups), 'buckets;', pool.valid_points,
+                  'valid points;', pool.padded_points, 'padded slots')
+            wrapper = ExportModel(model, pool).eval()
             export_inputs, input_names = (img,), ['img']
         if args.qat:
             if args.mapping_only:
@@ -279,6 +302,7 @@ def main():
         'quantization': 'oritek_qat_int8_conv_islands' if args.qat else 'floating_point',
         'geometry_mode': 'mapping' if args.runtime_mapping else 'fixed',
         'mapping_version': '3' if args.runtime_mapping else 'none',
+        'fixed_pool_mode': 'none' if args.runtime_mapping else 'direct',
         'geometry_frame': 'sensor2keyegos maps each camera sensor to the reference key ego frame',
         'occ_layout': 'NCHW; channel=z*num_classes+class'})
     graph.graph.output[-1].doc_string = (
@@ -301,7 +325,7 @@ def main():
     else:
         print('Fixed geometry:', args.geometry_npz or f'validation sample {args.sample_index}')
     for name, tensor in zip(names, outputs):
-        print(name, tuple(tensor.shape))
+        print(name, tuple(tensor.shape), tensor.dtype)
 
 if __name__ == '__main__':
     main()
