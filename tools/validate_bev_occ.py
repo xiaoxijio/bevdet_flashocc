@@ -78,9 +78,11 @@ def main():
             index=run_indices[position]
             with torch.no_grad(): result=model(return_loss=False,rescale=True,**data)[0]
             pred=np.asarray(result['occ'])
-            with np.load(dataset._occ_path(index)) as label:
-                gt=label['semantics'];mask=label['mask_camera'].astype(bool) & (gt<18)
-            if pred.shape!=gt.shape or np.any((pred<0)|(pred>=18)):raise ValueError('Invalid occupancy predictions')
+            gt,mask=dataset.load_occ_ground_truth(index)
+            if pred.shape!=gt.shape:
+                raise ValueError(f'Occupancy shape mismatch: prediction={pred.shape}, GT={gt.shape}, occ_crop={dataset.occ_crop}')
+            if np.any((pred<0)|(pred>=18)):
+                raise ValueError('Invalid occupancy class IDs; expected labels 0..17')
             if not (args.vis_only or args.smoke_test):
                 hist+=np.bincount(18*gt[mask].astype(np.int64)+pred[mask].astype(np.int64),minlength=324).reshape(18,18)
                 detections.append({'pts_bbox':result['pts_bbox']})

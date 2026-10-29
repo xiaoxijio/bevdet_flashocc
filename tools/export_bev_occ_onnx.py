@@ -135,8 +135,8 @@ class RuntimeMappingExportModel(ExportModel):
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     # TODO 在此修改路径
-    p.add_argument('--config', default='configs/bevdet/ep1_bevdet+flashocc/bevdet-b0-det-occ-g4-nose.py')
-    p.add_argument('--checkpoint', default='work_dirs/ep1_g4_b0_nose_stable/epoch_20_ema.pth')
+    p.add_argument('--config', default='configs/bevdet/ep1_bevdet+flashocc/bevdet-b0-det-occ-g6-occ128-nearfield.py')
+    p.add_argument('--checkpoint', default='work_dirs/ep1_g6_occ128_nearfield/epoch_20_ema.pth')
     p.add_argument('--output', help='Defaults to onnx/bev_occ_mapping.onnx in mapping mode, otherwise onnx/bev_occ.onnx')
     p.add_argument('--device', choices=['cuda', 'cpu'], default='cuda', help='Device used for export; does not change ONNX inputs')
     p.add_argument('--qat', action='store_true', help='Restore this project QAT checkpoint and use SDK export')

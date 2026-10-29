@@ -16,8 +16,12 @@ class NuScenesDatasetDetOcc(NuScenesDataset):
 
     IoU values are percentages; mIoU excludes free (class 17), matching Occ3D.
     """
-    def __init__(self, occ_gt_root=None, **kwargs):
+    def __init__(self, occ_gt_root=None, occ_crop=None, **kwargs):
         super().__init__(**kwargs)
+        self.occ_crop = tuple(occ_crop) if occ_crop is not None else None
+        if self.occ_crop is not None:
+            from .pipelines.crop_occ_targets import validate_occ_crop
+            validate_occ_crop(self.occ_crop)
         self.occ_gt_root = occ_gt_root or os.path.join(self.data_root, 'gts')
 
     def _occ_path(self, index):
@@ -33,19 +37,30 @@ class NuScenesDatasetDetOcc(NuScenesDataset):
         result['occ_gt_path'] = os.path.dirname(self._occ_path(index))
         return result
 
+    def load_occ_ground_truth(self, index):
+        """Return GT and camera mask in exactly the configured OCC region."""
+        with np.load(self._occ_path(index)) as labels:
+            gt = labels['semantics']
+            camera = labels['mask_camera']
+        if self.occ_crop is not None:
+            start, end = self.occ_crop
+            if gt.shape[:2] != (200, 200):
+                raise ValueError('occ_crop expects original 200x200 Occ3D labels')
+            gt = gt[start:end, start:end]
+            camera = camera[start:end, start:end]
+        return gt, camera.astype(bool) & (gt < 18)
+
     def _evaluate_occ(self, results):
         hist = np.zeros((18, 18), dtype=np.int64)
         for index, result in enumerate(results):
             pred = np.asarray(result['occ'])
-            with np.load(self._occ_path(index)) as labels:
-                gt = labels['semantics']
-                mask = labels['mask_camera'].astype(bool) & (gt < 18)
-                if pred.shape != gt.shape:
-                    raise ValueError('Prediction and Occ3D GT shapes differ')
-                if np.any((pred < 0) | (pred >= 18)):
-                    raise ValueError('Occupancy prediction must use labels 0..17')
-                hist += np.bincount(18 * gt[mask].astype(np.int64) +
-                                    pred[mask].astype(np.int64), minlength=324).reshape(18, 18)
+            gt, mask = self.load_occ_ground_truth(index)
+            if pred.shape != gt.shape:
+                raise ValueError('Prediction and Occ3D GT shapes differ')
+            if np.any((pred < 0) | (pred >= 18)):
+                raise ValueError('Occupancy prediction must use labels 0..17')
+            hist += np.bincount(18 * gt[mask].astype(np.int64) +
+                                pred[mask].astype(np.int64), minlength=324).reshape(18, 18)
         union = hist.sum(0) + hist.sum(1) - np.diag(hist)
         iou = np.divide(np.diag(hist), union, out=np.full(18, np.nan), where=union > 0)
         metrics = {'occ/' + name + '_IoU': float(iou[i] * 100)

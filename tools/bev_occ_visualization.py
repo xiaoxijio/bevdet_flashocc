@@ -144,7 +144,7 @@ def draw_bev_panel(title, bound=40., occupancy=None, boxes=None, gt_boxes=None,
             front=box[[4,5,6,7]].mean(0)[:2]
             a,b=ego_pixels([start,front],bound,side)
             cv2.line(roi,tuple(a),tuple(b),color,2,cv2.LINE_AA)
-    text(panel,'FRONT +x up  |  LEFT +y left  |  range +/-40 m',
+    text(panel,f'FRONT +x up  |  LEFT +y left  |  range +/-{bound:g} m',
          (28,635),.43,(65,65,65))
     return panel
 
@@ -204,14 +204,16 @@ def compose_frame(dataset,index,result,gt,mask,frame_number,threshold=.3):
     if len(gt_boxes):
         gt_corners=LiDARInstance3DBoxes(gt_boxes,box_dim=gt_boxes.shape[1],
                                       origin=(.5,.5,.5)).corners.numpy()
+    crop=getattr(dataset,'occ_crop',None)
+    occ_bound=40. if crop is None else (crop[1]-crop[0])*.4/2
     cameras=camera_mosaic(dataset,info,corners,labels)
     panels=[draw_bev_panel('DETECTION | color: prediction, gray: GT',boxes=corners,
                           gt_boxes=gt_corners,labels=labels,classes=dataset.CLASSES),
-            draw_bev_panel('OCC PREDICTION | camera-visible',occupancy=occupancy_rgb(result['occ'],mask)),
-            draw_bev_panel('OCC GROUND TRUTH | camera-visible',occupancy=occupancy_rgb(gt,mask))]
+            draw_bev_panel('OCC PREDICTION | camera-visible',bound=occ_bound,occupancy=occupancy_rgb(result['occ'],mask)),
+            draw_bev_panel('OCC GROUND TRUTH | camera-visible',bound=occ_bound,occupancy=occupancy_rgb(gt,mask))]
     header=np.full((58,1920,3),25,dtype=np.uint8)
     text(header,f'{scene_name(info)}  |  frame {frame_number:04d}  |  token {info["token"]}',(20,25),.65)
-    text(header,'Single-frame Det + FlashOCC | distance rings: 10 / 20 / 30 / 40 m | occupied top voxel',(20,47),.46)
+    text(header,'Single-frame Det + FlashOCC | distance rings: metric scale shown in each panel | occupied top voxel',(20,47),.46)
     legend=np.full((108,1920,3),245,dtype=np.uint8)
     for i,name in enumerate(OCC_NAMES[:17]):
         row,col=divmod(i,6);u,v=col*320+16,row*32+7

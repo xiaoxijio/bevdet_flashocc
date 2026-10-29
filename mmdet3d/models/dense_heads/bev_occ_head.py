@@ -45,6 +45,7 @@ class BEVOCCHead2D(BaseModule):
                  feature_upsample_scale=1,
                  feature_align_corners=False,
                  use_conv_predicter=False,
+                 predictor_hidden_dim=None,
                  ):
         super(BEVOCCHead2D, self).__init__()
         if isinstance(feature_upsample_scale, bool) or not isinstance(feature_upsample_scale, int) or feature_upsample_scale < 1:
@@ -66,19 +67,23 @@ class BEVOCCHead2D(BaseModule):
             bias=True,
             conv_cfg=dict(type='Conv2d')
         )
+        hidden_dim = self.out_dim * 2 if predictor_hidden_dim is None else predictor_hidden_dim
+        if isinstance(hidden_dim, bool) or not isinstance(hidden_dim, int) or hidden_dim <= 0:
+            raise ValueError("predictor_hidden_dim must be a positive integer")
+        self.predictor_hidden_dim = hidden_dim
         self.use_predicter = use_predicter
         self.use_conv_predicter = use_conv_predicter
         if use_predicter:
             if self.use_conv_predicter:
                 self.predicter = nn.Sequential(
-                    nn.Conv2d(self.out_dim, self.out_dim * 2, 1),
+                    nn.Conv2d(self.out_dim, hidden_dim, 1),
                     nn.Softplus(),
-                    nn.Conv2d(self.out_dim * 2, num_classes * Dz, 1))
+                    nn.Conv2d(hidden_dim, num_classes * Dz, 1))
             else:
                 self.predicter = nn.Sequential(
-                    nn.Linear(self.out_dim, self.out_dim * 2),
+                    nn.Linear(self.out_dim, hidden_dim),
                     nn.Softplus(),
-                    nn.Linear(self.out_dim * 2, num_classes * Dz))
+                    nn.Linear(hidden_dim, num_classes * Dz))
 
         self.use_mask = use_mask
         self.num_classes = num_classes
