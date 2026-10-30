@@ -43,6 +43,10 @@ def format_report(metrics, metadata):
             'Status: ' + metadata.get('status', 'unknown'),
             'Run: ' + metadata.get('run_id', 'unknown'),
             'Recorded UTC: ' + metadata.get('recorded_at_utc', 'unknown')]
+    if metadata.get('backend'):
+        rows.append('Backend: ' + metadata['backend'])
+    if metadata.get('partial'):
+        rows.append('Scope: PARTIAL dataset; not an official full validation result')
     for name in ('config', 'checkpoint'):
         identity = metadata.get(name) or {}
         rows.append(name + ': ' + identity.get('path', 'not recorded'))

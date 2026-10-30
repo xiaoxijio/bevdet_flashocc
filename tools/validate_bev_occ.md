@@ -1,104 +1,72 @@
-# 单帧 Det + FlashOCC：连续场景合成图与视频
+# Det + OCC：验证与可视化独立入口
 
-所有命令在3090的 `/home/fjm/tong/BEVDet` 根目录、`bevdet` 环境执行。
-可视化直接使用PyTorch模型，不经过ONNX。
+在项目根目录、已安装本项目依赖的 `bevdet` 环境执行。两种入口均用
+`--backend pth|onnx` 选择模型格式，默认 `pth`。第二个位置参数是对应模型文件。
 
-## 只看连续场景，不跑指标
+- `tools/validate_bev_occ.py`：仅验证、保存指标与检测结果，不绘图。
+- `tools/visualize_bev_occ.py`：仅推理选定场景、输出图像/视频，不启动指标评估。
+- 共享推理实现：`tools/bev_occ_inference.py`。
+- 绘图实现和详细用法：[visualize_bev_occ.md](visualize_bev_occ.md)。
 
-```bash
-python tools/validate_bev_occ.py \
-  'configs/bevdet/ep0_bevdet+flashocc/bevdet-r50-det-occ-shared-2gpu-32gb-pretrained.py' \
-  ckpt/epoch_20_ema.pth \
-  --vis-only --scene scene-0268 --vis-every 1 --fps 2 --workers 0 \
-  --out-dir work_dirs/vis_epoch20_video
-```
+原来的 `--vis-only`、`--vis-count` 等绘图参数已移至可视化入口。
 
-- `--scene scene-0268`：按场景名选择，也支持scene token及多个场景名。
-- 不指定 `--scene` 时，默认选择按时间排序的第一个场景。
-- `--scene-count 3`：前三个场景；`--scene-count 0`：全部场景。
-- `--vis-count 10`：总共最多10帧；默认0表示所选场景的全部帧。
-- `--vis-every 1`：每帧都画，保证连续。不要沿用旧版每50帧抽样的设置。
-- `--fps 2`：nuScenes关键帧约2Hz，正常速度；设为5等可加速播放。
-- `--no-video`：只存合成JPG。默认生成MP4，ffmpeg可用时使用H.264。
-- `--save-occupancy`：另外保存完整体素预测/GT/mask NPZ；默认不额外存。
-- `--smoke-test 2`：只检查选中场景的前两帧，也不算官方指标。
-
-只可视化模式只推理选定帧，不先跑完整6019帧，不加载nuScenes官方评估器，
-也不在内存中保存所有体素预测。
-
-## 输出：同一个目录，一帧一图，一个场景一个视频
-
-```text
-work_dirs/vis_epoch20_video/visualizations/
-├── scene-0268_00000.jpg
-├── scene-0268_00001.jpg
-├── ...
-├── scene-0268.mp4
-└── index.json
-```
-
-多个场景也在这个目录中，用场景名区分，不再每帧新建文件夹。
-index.json记录token、数据集索引、时间戳及场景内帧号。
-只在场景内部按timestamp连续播放，不把不同场景拼成一次行驶。
-
-## 每帧排版与坐标
-
-- 上方：六路图像+预测3D框，前排为左前/前/右前，后排为右后/后/左后；原图不镜像。
-- 下方：检测BEV、OCC预测俯视、OCC GT俯视，最后是统一语义图例。
-- 三个BEV统一覆盖[-40,40]米，车头+x向上，车左+y向左；检测范围外的框不显示。
-- 三个BEV以自车原点为圆心绘制10/20/30/40米距离圈及十字参考轴，圈上标半径；不绘制自车车身。
-- 检测彩色实线为预测，灰线为GT；类别颜色与占用语义一致。
-- OCC只展示camera-visible体素，每个水平位置取最高非free体素，并非地面语义投影。
-- 自车坐标使用数据集的ego_cam参考；不会误用相机自身坐标作为自车位置。
-
-布局参考Sparse4D官方的六视角相机标签、BEV上下文及连续图像/视频输出，
-根据当前双任务输出实现了相机在上、三张BEV在下的排版：
-https://github.com/HorizonRobotics/Sparse4D/blob/main/projects/mmdet3d_plugin/datasets/nuscenes_3d_det_track_dataset.py
-
-实现位于 tools/bev_occ_visualization.py；不依赖Sparse4D运行环境。
-
-## 全量验证（与仅可视化区分）
-
-不加 `--vis-only` 时仍会推理完整验证集、累计OCC混淆矩阵并评估检测。
-`--scene` 等选择参数只决定哪些帧绘图，不影响正式指标的数据范围。
+## PTH 验证
 
 ```bash
 python tools/validate_bev_occ.py \
-  'configs/bevdet/ep0_bevdet+flashocc/bevdet-r50-det-occ-shared-2gpu-32gb-pretrained.py' \
-  ckpt/epoch_20_ema.pth \
-  --scene-count 1 --workers 0 --skip-det-eval \
-  --out-dir work_dirs/eval_epoch20_new
+  'configs/bevdet/ep1_bevdet+flashocc/bevdet-b0-det-occ-g6-occ128-nearfield.py' \
+  work_dirs/ep1_g6_occ128_nearfield/epoch_20_ema.pth \
+  --backend pth --workers 2 --out-dir work_dirs/g6_eval_pth
 ```
 
-3090系统内存有限，上例加 `--skip-det-eval`：保存detections.pkl和OCC指标，
-跳过内存开销较大的nuScenes检测指标计算。去掉该参数可计算完整Det+OCC指标。
-没有该参数时，OCC指标和检测预测也会先落盘，再开始检测评估。
-
-## 验证
-
-- 场景选择与排序、检测/占用朝向、图像合成、米制距离圈和平铺目录测试。
-- epoch_20_ema真实模型已跑通scene-0268连续10帧，生成合成图及H.264 MP4。
-- 完整场景视频使用同一模型再次生成；index.json保留对应时间戳。
+## ONNX 验证
 
 ```bash
-python -m pytest -q tests/test_tools/test_bev_occ_visualization.py
+python tools/validate_bev_occ.py \
+  'configs/bevdet/ep1_bevdet+flashocc/bevdet-b0-det-occ-g6-occ128-nearfield.py' \
+  onnx/g6_pool.onnx --backend onnx --onnx-provider cpu \
+  --workers 2 --out-dir work_dirs/g6_eval_onnx
 ```
 
-## 评估结果持久保存
+ONNX 仅替换网络前向，检测解码、阈值和 NMS 复用配置对应的原项目检测头。
+OCC 依照导出约定将 `[1,Dz*C,Y,X]` 转为 `[X,Y,Z]`，统计相同 GT/camera mask。
+需要本项目的 MMCV/MMDet3D 环境，不是独立 ONNX-only 运行器。
 
-`tools/validate_bev_occ.py`正式评估会自动保存：
+`--onnx-provider cpu|cuda` 选择 ONNX Runtime 的执行后端，默认 CPU；CUDA 需要兼容的
+`onnxruntime-gpu`。`--device cuda|cpu` 控制 PTH 和检测后处理，默认 CUDA，GPU 由
+`--gpu-id` 选择。纯 CPU 测试可使用 `--device cpu --workers 0 --threads 4`。
+PTH CPU 路径使用同一 checkpoint 和逐帧几何下的 PyTorch Pool 分解，避开 CUDA-only BEVPool；
+CUDA PTH 路径使用原模型原生推理。checkpoint 带本项目 QAT 元数据时自动按匹配配置恢复量化层。
 
-- `metrics.txt`：便于阅读的Det总指标、逐类别AP/误差、OCC逐类别IoU和mIoU。
-- `metrics.json`：原始指标数值，便于程序比较。
-- `run_metadata.json`：配置/权重路径和SHA256、命令参数、样本数及运行状态。
-- `reports/<UTC时间_唯一ID>/`：每次运行独立归档上述文件和展开后的`config.py`。
+## 快速检查、部分验证
 
-输出目录根部保存最近一次结果；历史指标归档不会被下一次运行覆盖。
-检测评估开始前先保存OCC报告，并将状态标为`occ_complete_detection_pending`；
-检测评估成功后状态为`complete`。`--skip-det-eval`时状态为
-`occ_complete_detection_skipped`，检测指标显示N/A，避免误当作完整验证。
-`--vis-only` / `--smoke-test`不计算正式指标，也不生成这些评估报告。
-历史归档保存指标及配置/权重身份信息，不复制checkpoint、图片、视频或detections.pkl。
+```bash
+# 上面任一命令追加这些参数，仅验证前两帧；不会产生官方全量检测分数。
+--limit 2 --device cpu --workers 0
+```
 
-建议每组仍使用独立的`--out-dir`；日常直接查看对应目录的`metrics.txt`即可，
-不需要重跑验证或依赖终端记录。mAP/NDS使用0–1数值，OCC IoU/mIoU使用百分数。
+`--smoke-test N` 是 `--limit N` 的别名。部分数据的报告显式标记 PARTIAL，计算该子集的 OCC IoU，
+保存检测结果但跳过官方 nuScenes 检测评估。正式验证时不要使用 `--limit`。
+
+`--skip-det-eval` 用于全量统计 OCC 并保存检测结果，跳过官方检测指标；可避免额外评估内存开销。
+mAP/NDS 为 0–1；OCC IoU/mIoU 为百分数，mIoU 排除 free 类。
+
+## 结果
+
+- `metrics.txt/json`：最新指标；`occ_metrics.json`、`occ_confusion.npy`：OCC 统计。
+- `detections.pkl`：检测预测。
+- `run_metadata.json`：模型/配置 SHA256、backend、参数、样本索引和运行状态。
+- `reports/<UTC时间_唯一ID>/`：每次运行独立归档指标、元数据和展开的配置。
+
+检测评估开始前先保存 OCC 报告；失败时保存错误状态，不把缺失检测结果当作完整验证。
+
+## ONNX 几何约定
+
+单输入 fixed-geometry ONNX 始终使用导出时固化的相机映射，不会随验证样本重新计算；
+其全数据集指标衡量的是这个固定几何部署模型，不能将其与逐帧动态几何的 PTH 视为天然等价。
+当前 g6 单帧测试中，两者的 OCC 混淆矩阵一致，不代表全验证集完全一致。
+
+多输入 runtime-mapping ONNX 会逐帧生成 v3 映射，自动加载模型同名 `.mapping.json`，
+也可通过 `--mapping-layout FILE` 指定；容量不足会报错，不截断投影点。
+
+ONNX 验证是原始导出网络的验证，不是编译后 ORTM/板端量化精度验证。

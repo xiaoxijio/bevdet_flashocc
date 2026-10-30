@@ -53,7 +53,10 @@ def test_composite_and_flat_outputs_contain_distance_rings_and_manifest(tmp_path
     assert not any(p.is_dir() for p in tmp_path.iterdir())
     image=vis.compose_frame(dataset,0,result,result['occ'],mask,0)
     assert image.shape==(1526,1920,3)
-    assert np.count_nonzero(np.all(image==vis.RING_COLOR,axis=-1)) > 100
+    # Only the detection panel has rings now; the two OCC panels are 3D.
+    # Accept antialiased strokes instead of requiring an exact pixel color.
+    plot = image[842:1386, 48:592].astype(np.int16)
+    assert np.count_nonzero(np.max(np.abs(plot-np.asarray(vis.RING_COLOR)),axis=-1) < 30) > 100
     import json
     assert json.loads((tmp_path/'index.json').read_text())['scene_frames']=={'scene-0001':1}
 
