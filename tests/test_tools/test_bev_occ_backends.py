@@ -22,12 +22,25 @@ def test_nchw_occ_decode_does_not_swap_xy_or_height():
     with pytest.raises(ValueError): inference.occ_from_nchw(raw,dz,classes)
 
 
-def test_backend_is_one_shared_switch():
-    for backend, model in [('pth','weights.pth'),('onnx','model.onnx')]:
-        parser=argparse.ArgumentParser()
-        inference.add_inference_arguments(parser)
-        args=parser.parse_args(['config.py',model,'--backend',backend])
-        assert args.backend==backend and args.model==model
+@pytest.mark.parametrize("model,expected", [
+    ("weights.pth", "pth"), ("model.onnx", "onnx"),
+    ("dir/MODEL.PTH", "pth"), ("dir/MODEL.ONNX", "onnx"),
+])
+def test_backend_is_inferred_from_model_suffix(model, expected):
+    parser = argparse.ArgumentParser()
+    inference.add_inference_arguments(parser)
+    args = inference.parse_inference_arguments(parser, ["config.py", model])
+    assert args.backend == expected and args.model == model
+
+
+def test_unknown_model_suffix_and_removed_backend_switch_are_rejected():
+    parser = argparse.ArgumentParser()
+    inference.add_inference_arguments(parser)
+    for argv in (["config.py", "model.bin"], ["config.py", "model.pth.tar"],
+                 ["config.py", "model.onnx", "--backend", "pth"]):
+        with pytest.raises(SystemExit) as error:
+            inference.parse_inference_arguments(parser, argv)
+        assert error.value.code == 2
 
 
 def test_3d_renderer_is_masked_and_shows_height():
@@ -49,6 +62,18 @@ def test_entrypoints_separate_evaluation_and_visualization():
     root = Path(vis.__file__).parent
     validation = subprocess.check_output([sys.executable, str(root/'validate_bev_occ.py'), '--help'], text=True)
     rendering = subprocess.check_output([sys.executable, str(root/'visualize_bev_occ.py'), '--help'], text=True)
-    assert '--backend' in validation and '--backend' in rendering
+    assert '--backend' not in validation and '--backend' not in rendering
     assert '--vis-only' not in validation and '--scene' not in validation
     assert '--skip-det-eval' not in rendering and '--scene' in rendering
+
+
+def test_fake_quant_flag_is_explicit_and_rejects_onnx():
+    parser = argparse.ArgumentParser()
+    inference.add_inference_arguments(parser)
+    default = inference.parse_inference_arguments(parser, ["config.py", "qat.pth"])
+    disabled = inference.parse_inference_arguments(parser, ["config.py", "qat.pth", "--disable-fake-quant"])
+    assert not default.disable_fake_quant
+    assert disabled.disable_fake_quant
+    with pytest.raises(SystemExit) as error:
+        inference.parse_inference_arguments(parser, ["config.py", "model.onnx", "--disable-fake-quant"])
+    assert error.value.code == 2

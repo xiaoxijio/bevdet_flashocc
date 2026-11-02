@@ -1,7 +1,7 @@
 # Det + OCC：验证与可视化独立入口
 
 在项目根目录、已安装本项目依赖的 `bevdet` 环境执行。两种入口均用
-`--backend pth|onnx` 选择模型格式，默认 `pth`。第二个位置参数是对应模型文件。
+模型文件后缀自动选择推理方式：`.pth` 使用 PyTorch，`.onnx` 使用 ONNX Runtime（不区分大小写）。不再需要 `--backend` 参数。
 
 - `tools/validate_bev_occ.py`：仅验证、保存指标与检测结果，不绘图。
 - `tools/visualize_bev_occ.py`：仅推理选定场景、输出图像/视频，不启动指标评估。
@@ -16,7 +16,7 @@
 python tools/validate_bev_occ.py \
   'configs/bevdet/ep1_bevdet+flashocc/bevdet-b0-det-occ-g6-occ128-nearfield.py' \
   work_dirs/ep1_g6_occ128_nearfield/epoch_20_ema.pth \
-  --backend pth --workers 2 --out-dir work_dirs/g6_eval_pth
+  --workers 2 --out-dir work_dirs/g6_eval_pth
 ```
 
 ## ONNX 验证
@@ -24,7 +24,7 @@ python tools/validate_bev_occ.py \
 ```bash
 python tools/validate_bev_occ.py \
   'configs/bevdet/ep1_bevdet+flashocc/bevdet-b0-det-occ-g6-occ128-nearfield.py' \
-  onnx/g6_pool.onnx --backend onnx --onnx-provider cpu \
+  onnx/g6.onnx --onnx-provider cuda \
   --workers 2 --out-dir work_dirs/g6_eval_onnx
 ```
 
@@ -70,3 +70,21 @@ mAP/NDS 为 0–1；OCC IoU/mIoU 为百分数，mIoU 排除 free 类。
 也可通过 `--mapping-layout FILE` 指定；容量不足会报错，不截断投影点。
 
 ONNX 验证是原始导出网络的验证，不是编译后 ORTM/板端量化精度验证。
+
+
+## QAT 伪量化开关（诊断实验）
+
+QAT PTH 默认开启伪量化：启用 SDK `enable_quantize`，同时 `disable_observer` 冻结量化参数。
+不加参数就是原来的 QAT 评估。`--disable-fake-quant` 仅关闭量化模拟，保留同一份训练后的权重，
+不会修改或保存 checkpoint。它不代表真实 INT8 部署精度，也不等于原始浮点 g6。
+
+```bash
+# 开启：默认行为
+python tools/validate_bev_occ.py CONFIG ckpt/g6_qat.pth --out-dir work_dirs/g6_qat_fake_on
+# 关闭：同一 checkpoint，单独目录，便于对照
+python tools/validate_bev_occ.py CONFIG ckpt/g6_qat.pth --disable-fake-quant --out-dir work_dirs/g6_qat_fake_off
+```
+
+输出日志和 `metrics.txt` 的 Note 会显示 ON/OFF；参数也记录在 run_metadata.json。
+ONNX 的 Q/DQ 已固化在图中，不接受该开关；普通非 QAT PTH 也会拒绝此参数。
+可视化入口使用同一共享参数，支持对 QAT PTH 做相同诊断。

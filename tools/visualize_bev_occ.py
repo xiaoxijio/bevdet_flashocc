@@ -7,7 +7,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from bev_occ_inference import (add_inference_arguments, checked_occupancy, load_context,
-                               make_loader, make_predictor, unpack_batch)
+                               make_loader, make_predictor, parse_inference_arguments, unpack_batch)
 
 
 def main():
@@ -25,7 +25,7 @@ def main():
     parser.add_argument('--occ-view', choices=('3d', 'bev'), default='3d')
     parser.add_argument('--occ-mask', choices=('camera', 'all'), default='camera',
                         help='Use the same camera visibility mask for prediction and GT, or show all voxels')
-    args = parser.parse_args()
+    args = parse_inference_arguments(parser)
     if args.vis_every < 1 or min(args.vis_count, args.scene_count) < 0 or args.fps <= 0 or not 0 <= args.score_thr <= 1:
         parser.error('Invalid frame count, stride, FPS or threshold')
     import mmcv

@@ -6,16 +6,16 @@
 python tools/visualize_bev_occ.py \
   'configs/bevdet/ep1_bevdet+flashocc/bevdet-b0-det-occ-g6-occ128-nearfield.py' \
   work_dirs/ep1_g6_occ128_nearfield/epoch_20_ema.pth \
-  --backend pth --scene scene-0268 --vis-count 10 --workers 0 \
+  --scene scene-0268 --vis-count 10 --workers 0 \
   --out-dir work_dirs/g6_vis_pth
 ```
 
-ONNX 只需将模型文件和 backend 换成：
+ONNX 只需换成 `.onnx` 模型文件：
 
 ```bash
 python tools/visualize_bev_occ.py \
   'configs/bevdet/ep1_bevdet+flashocc/bevdet-b0-det-occ-g6-occ128-nearfield.py' \
-  onnx/g6_pool.onnx --backend onnx --scene scene-0268 --vis-count 10 \
+  onnx/g6_pool.onnx --scene scene-0268 --vis-count 10 \
   --device cpu --workers 0 --out-dir work_dirs/g6_vis_onnx
 ```
 

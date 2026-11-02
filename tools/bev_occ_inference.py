@@ -11,7 +11,6 @@ KEYS = ('reg', 'height', 'dim', 'rot', 'vel', 'heatmap')
 def add_inference_arguments(parser):
     parser.add_argument('config', help='Matching joint Det/OCC config')
     parser.add_argument('model', help='PTH checkpoint or exported ONNX model')
-    parser.add_argument('--backend', choices=('pth', 'onnx'), default='pth')
     parser.add_argument('--device', choices=('cuda', 'cpu'), default='cuda',
                         help='PTH and detection postprocessing device')
     parser.add_argument('--gpu-id', type=int, default=0)
@@ -19,6 +18,28 @@ def add_inference_arguments(parser):
     parser.add_argument('--threads', type=int, default=4)
     parser.add_argument('--onnx-provider', choices=('cpu', 'cuda'), default='cpu')
     parser.add_argument('--mapping-layout', help='Runtime-mapping ONNX layout JSON; auto-detected alongside ONNX')
+    parser.add_argument("--disable-fake-quant", action="store_true",
+                        help="Diagnostic QAT PTH only: disable simulated INT8 rounding/clipping; keep observers frozen")
+
+
+
+def backend_from_model(model):
+    suffix = Path(model).suffix.lower()
+    formats = {".pth": "pth", ".onnx": "onnx"}
+    if suffix not in formats:
+        raise ValueError("Model must have a .pth or .onnx extension: " + str(model))
+    return formats[suffix]
+
+
+def parse_inference_arguments(parser, argv=None):
+    args = parser.parse_args(argv)
+    try:
+        args.backend = backend_from_model(args.model)
+        if args.disable_fake_quant and args.backend != "pth":
+            parser.error("--disable-fake-quant requires a QAT .pth checkpoint; ONNX quantization is baked into the graph")
+    except ValueError as exc:
+        parser.error(str(exc))
+    return args
 
 
 def load_context(args):
@@ -30,10 +51,9 @@ def load_context(args):
         raise ValueError('workers/gpu-id must be nonnegative; threads must be positive')
     if not Path(args.model).is_file():
         raise FileNotFoundError(args.model)
-    if args.backend == 'onnx' and Path(args.model).suffix.lower() != '.onnx':
-        raise ValueError('--backend onnx requires an ONNX file')
+    args.backend = backend_from_model(args.model)
     if args.backend == 'pth' and args.mapping_layout:
-        raise ValueError('--mapping-layout is only used with --backend onnx')
+        raise ValueError('--mapping-layout is only used with ONNX models')
     torch.set_num_threads(args.threads)
     if args.device == 'cuda':
         if not torch.cuda.is_available():
@@ -91,7 +111,10 @@ class PthPredictor:
         state = {k[7:] if k.startswith('module.') else k: v for k, v in state.items()}
         self.device = torch.device(f'cuda:{args.gpu_id}' if args.device == 'cuda' else 'cpu')
         self.model.to(self.device)
-        if checkpoint.get('meta', {}).get('oritek_qat'):
+        self.is_qat = bool(checkpoint.get("meta", {}).get("oritek_qat"))
+        if args.disable_fake_quant and not self.is_qat:
+            raise ValueError("--disable-fake-quant requires a QAT checkpoint with oritek_qat metadata")
+        if self.is_qat:
             from mmdet3d.utils.oritek_qat import convert_convolutions, validate_recipe, qat_tool
             validate_recipe(checkpoint, cfg.get('qat', {}))
             # Use the export wrapper to initialize quantizer shapes without CUDA-only BEV pooling.
@@ -99,12 +122,20 @@ class PthPredictor:
             self.model = convert_convolutions(self.model, cfg.qat, lambda: wrapper(example['img_inputs'][0][0].squeeze(0)))
             self.model.load_state_dict(state, strict=True)
             self.model.to(self.device).eval()
-            qat_tool().disable_observer(self.model)
+            q = qat_tool()
+            q.disable_observer(self.model)
+            if args.disable_fake_quant:
+                q.disable_quantize(self.model)
+            else:
+                q.enable_quantize(self.model)
         else:
             self.model.load_state_dict(state, strict=True)
         self.model.CLASSES = dataset.CLASSES
         self.model.eval()
         self.description = 'PTH native inference' if args.device == 'cuda' else 'PTH CPU: same weights, PyTorch fixed-pool decomposition per frame'
+        if self.is_qat:
+            self.description += ("; QAT fake quantization OFF (floating-point diagnostic, not INT8 deployment)"
+                                 if args.disable_fake_quant else "; QAT fake quantization ON; observers frozen")
 
     def cpu_compatible_wrapper(self, data):
         from tools.export_bev_occ_onnx import ExportModel, FixedPool
@@ -179,6 +210,8 @@ class OnnxPredictor:
                 raise RuntimeError('CUDA ONNX Runtime provider unavailable; use --onnx-provider cpu or install matching onnxruntime-gpu')
             providers.insert(0, ('CUDAExecutionProvider', {'device_id': args.gpu_id}))
         self.session = ort.InferenceSession(args.model, sess_options=options, providers=providers)
+        if args.onnx_provider == "cuda" and "CUDAExecutionProvider" not in self.session.get_providers():
+            raise RuntimeError("CUDA provider failed to initialize; refusing silent CPU fallback. Check CUDA/cuDNN library compatibility.")
         self.inputs = self.session.get_inputs()
         self.output_names = [o.name for o in self.session.get_outputs()]
         expected = {f'det_task{i}_{k}' for i in range(len(self.head.task_heads)) for k in KEYS} | {'occ_logits'}

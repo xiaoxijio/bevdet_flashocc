@@ -6,7 +6,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from bev_occ_inference import (add_inference_arguments, checked_occupancy, load_context,
-                               make_loader, make_predictor, unpack_batch)
+                               make_loader, make_predictor, parse_inference_arguments, unpack_batch)
 from bev_occ_reporting import create_report_run, file_identity, save_report
 
 
@@ -17,7 +17,7 @@ def main():
     parser.add_argument('--limit', '--smoke-test', dest='limit', type=int, default=0,
                         help='First N samples; 0=full set. Partial runs skip official detection metrics.')
     parser.add_argument('--skip-det-eval', action='store_true', help='Save detections and OCC metrics; skip nuScenes detection metrics')
-    args = parser.parse_args()
+    args = parse_inference_arguments(parser)
     if args.limit < 0:
         parser.error('--limit must be nonnegative')
     import mmcv
