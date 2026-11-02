@@ -1,4 +1,4 @@
-"""Evaluate joint Det/OCC PTH or ONNX; no rendering or video generation."""
+"""Evaluate joint Det/OCC PTH, ONNX or fake-quant ORTM; no rendering or video generation."""
 import argparse
 import json
 import sys
@@ -47,6 +47,7 @@ def main():
             if predictor is None:
                 predictor = make_predictor(args, cfg, dataset, data)
                 metadata['note'] = predictor.description
+                metadata.update(getattr(predictor, 'metadata', {}))
                 print(predictor.description)
             result = predictor(data)
             pred = checked_occupancy(result, gt)

@@ -1,7 +1,7 @@
 # Det + OCC：验证与可视化独立入口
 
 在项目根目录、已安装本项目依赖的 `bevdet` 环境执行。两种入口均用
-模型文件后缀自动选择推理方式：`.pth` 使用 PyTorch，`.onnx` 使用 ONNX Runtime（不区分大小写）。不再需要 `--backend` 参数。
+模型文件后缀自动选择推理方式：`.pth` 使用 PyTorch，`.onnx` 使用 ONNX Runtime，`*_fake_quant.ortm` 使用 SDK `oritek_graph_runner`（后缀不区分大小写）。不再需要 `--backend` 参数。
 
 - `tools/validate_bev_occ.py`：仅验证、保存指标与检测结果，不绘图。
 - `tools/visualize_bev_occ.py`：仅推理选定场景、输出图像/视频，不启动指标评估。
@@ -88,3 +88,61 @@ python tools/validate_bev_occ.py CONFIG ckpt/g6_qat.pth --disable-fake-quant --o
 输出日志和 `metrics.txt` 的 Note 会显示 ON/OFF；参数也记录在 run_metadata.json。
 ONNX 的 Q/DQ 已固化在图中，不接受该开关；普通非 QAT PTH 也会拒绝此参数。
 可视化入口使用同一共享参数，支持对 QAT PTH 做相同诊断。
+
+
+## 编译后 fake-quant ORTM 验证（PC）
+
+共用 `tools/validate_bev_occ.py`，仅网络前向由 `tools/bev_occ_ortm.py` 调用 SDK 工具，
+预处理、检测解码/NMS、nuScenes mAP/NDS 和 OCC camera-mask mIoU 统计复用原评测。
+只支持单输入、固定几何的 `*_fake_quant.ortm`；正式部署 `.ortm` 需要仿真器或板端运行器。
+这对应《NPU工具使用指南》第4章的量化损失评估，不是板端性能测试。
+
+在 3090 上：
+
+```bash
+source /home/fjm/miniconda3/bin/activate bevdet
+cd /home/fjm/tong/BEVDet
+
+# 先验证前两帧：OCC 子集指标、检测预测，不计算官方 mAP。
+python tools/validate_bev_occ.py \
+  'configs/bevdet/ep1_bevdet+flashocc/bevdet-b0-det-occ-g6-occ128-nearfield.py' \
+  ortm/g6_fake_quant.ortm \
+  --ortm-onnx /home/fjm/tong/Compilation/app/bev_occ/tmp_models/g6.onnx \
+  --ortm-provider cuda --workers 0 --limit 2 \
+  --out-dir work_dirs/g6_eval_ortm_smoke
+
+# 全验证集：计算 mAP、NDS 和 mIoU。
+python tools/validate_bev_occ.py \
+  'configs/bevdet/ep1_bevdet+flashocc/bevdet-b0-det-occ-g6-occ128-nearfield.py' \
+  ortm/g6_fake_quant.ortm \
+  --ortm-onnx /home/fjm/tong/Compilation/app/bev_occ/tmp_models/g6.onnx \
+  --ortm-provider cuda --workers 2 \
+  --out-dir work_dirs/g6_eval_ortm
+```
+
+QAT 编译产物可将模型改为 `ortm/g6_qat_fake_quant.ortm`，保持与导出模型匹配的架构配置。
+如有多份同名 ONNX，建议显式指定编译时使用的那一份：
+
+```bash
+--ortm-onnx /home/fjm/tong/Compilation/app/bev_occ/tmp_models/g6_qat.onnx
+```
+
+参数：
+
+- `--npu-toolchain`：工具链根目录。默认读取 `NPU_TOOLCHAIN_PATH`，未设置时使用项目旁的
+  `/home/fjm/tong/npu_toolchain`，调用 `linux/simulator/bin/oritek_graph_runner`。
+- `--ortm-provider cuda|cpu`：ORTM 前向设备，默认 CUDA，GPU 编号使用 `--gpu-id`。
+  `--device` 独立控制检测后处理；全 CPU 可用 `--ortm-provider cpu --device cpu`。
+- `--ortm-onnx`：与编译模型对应的源 ONNX，仅用于读取输入/输出名称、静态形状和 FP32 类型，
+  不执行 ONNX 前向。不指定时按去掉 `_fake_quant` 的名称依次查找 ORTM 同目录和项目 `onnx/`。
+- `--ortm-timeout`：每帧 SDK 进程超时秒数，默认 180。
+
+SDK 子进程自动添加 simulator 动态库路径；机器存在 CUDA 11.8/cuDNN 8 时优先使用该环境。
+每帧使用独立临时目录，正常运行后自动清理输入/输出，无逐层 dump。
+当前每帧启动一次 SDK 进程，有模型加载开销；实际处理速度以评测进度条为准。
+输出按 tensor 名称匹配，检查 FP32 字节数、shape 和有限值，失败时停止并报告 SDK 错误。
+报告记录 ORTM、源 ONNX、SDK runner 的 SHA256 和张量形状。
+源 ONNX 必须与 ORTM 对应；形状检查无法证明两份文件的权重来自同一次编译。
+
+正式结果在 `metrics.txt/json`、`occ_metrics.json`、`detections.pkl` 及 `reports/` 中。
+使用同一源 ONNX 和同一验证集的结果作对照，可观察编译量化带来的 mAP/mIoU 变化。

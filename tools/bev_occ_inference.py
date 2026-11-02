@@ -1,4 +1,4 @@
-"""Shared PTH/ONNX inference and postprocessing for evaluation and rendering."""
+"""Shared PTH/ONNX/ORTM inference and postprocessing for evaluation and rendering."""
 import copy
 import json
 from pathlib import Path
@@ -10,13 +10,18 @@ KEYS = ('reg', 'height', 'dim', 'rot', 'vel', 'heatmap')
 
 def add_inference_arguments(parser):
     parser.add_argument('config', help='Matching joint Det/OCC config')
-    parser.add_argument('model', help='PTH checkpoint or exported ONNX model')
+    parser.add_argument('model', help='PTH checkpoint, ONNX model, or SDK fake-quant ORTM')
     parser.add_argument('--device', choices=('cuda', 'cpu'), default='cuda',
                         help='PTH and detection postprocessing device')
     parser.add_argument('--gpu-id', type=int, default=0)
     parser.add_argument('--workers', type=int, default=2)
     parser.add_argument('--threads', type=int, default=4)
     parser.add_argument('--onnx-provider', choices=('cpu', 'cuda'), default='cpu')
+    parser.add_argument('--npu-toolchain', help='SDK npu_toolchain root; defaults to NPU_TOOLCHAIN_PATH or ../npu_toolchain')
+    parser.add_argument('--ortm-provider', choices=('cpu', 'cuda'), default='cuda',
+                        help='Fake-quant ORTM execution device (independent of --device)')
+    parser.add_argument('--ortm-onnx', help='Matching source ONNX for input/output metadata; auto-detected from model basename')
+    parser.add_argument('--ortm-timeout', type=float, default=180, help='Per-frame SDK process timeout in seconds')
     parser.add_argument('--mapping-layout', help='Runtime-mapping ONNX layout JSON; auto-detected alongside ONNX')
     parser.add_argument("--disable-fake-quant", action="store_true",
                         help="Diagnostic QAT PTH only: disable simulated INT8 rounding/clipping; keep observers frozen")
@@ -25,9 +30,9 @@ def add_inference_arguments(parser):
 
 def backend_from_model(model):
     suffix = Path(model).suffix.lower()
-    formats = {".pth": "pth", ".onnx": "onnx"}
+    formats = {".pth": "pth", ".onnx": "onnx", ".ortm": "ortm"}
     if suffix not in formats:
-        raise ValueError("Model must have a .pth or .onnx extension: " + str(model))
+        raise ValueError("Model must have a .pth, .onnx, or .ortm extension: " + str(model))
     return formats[suffix]
 
 
@@ -36,7 +41,7 @@ def parse_inference_arguments(parser, argv=None):
     try:
         args.backend = backend_from_model(args.model)
         if args.disable_fake_quant and args.backend != "pth":
-            parser.error("--disable-fake-quant requires a QAT .pth checkpoint; ONNX quantization is baked into the graph")
+            parser.error("--disable-fake-quant requires a QAT .pth checkpoint; ONNX/ORTM quantization is baked into the graph")
     except ValueError as exc:
         parser.error(str(exc))
     return args
@@ -52,7 +57,7 @@ def load_context(args):
     if not Path(args.model).is_file():
         raise FileNotFoundError(args.model)
     args.backend = backend_from_model(args.model)
-    if args.backend == 'pth' and args.mapping_layout:
+    if args.backend != 'onnx' and args.mapping_layout:
         raise ValueError('--mapping-layout is only used with ONNX models')
     torch.set_num_threads(args.threads)
     if args.device == 'cuda':
@@ -261,4 +266,7 @@ class OnnxPredictor:
 
 
 def make_predictor(args, cfg, dataset, example):
+    if args.backend == 'ortm':
+        from bev_occ_ortm import OrtmPredictor
+        return OrtmPredictor(args, cfg, dataset, example)
     return (PthPredictor if args.backend == 'pth' else OnnxPredictor)(args, cfg, dataset, example)

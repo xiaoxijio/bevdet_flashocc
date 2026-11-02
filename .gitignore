@@ -123,6 +123,7 @@ mmdet3d/.mim
 *.pth
 *.onnx
 onnx/
+ortm/
 
 # demo
 *.jpg
