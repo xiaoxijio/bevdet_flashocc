@@ -783,8 +783,8 @@ class LSSViewTransformerBEVDepth(LSSViewTransformer):
         gt_depths = gt_depths.view(-1, self.downsample * self.downsample)
         gt_depths_tmp = torch.where(gt_depths == 0.0,
                                     1e5 * torch.ones_like(gt_depths),
-                                    gt_depths)
-        gt_depths = torch.min(gt_depths_tmp, dim=-1).values
+                                    gt_depths)  # 这里 0 表示没有 LiDAR 深度，先替换成很大的数，避免被 min() 选中
+        gt_depths = torch.min(gt_depths_tmp, dim=-1).values # 取区域内最近的有效深度
         gt_depths = gt_depths.view(B * N, H // self.downsample,
                                    W // self.downsample)
 
@@ -819,7 +819,7 @@ class LSSViewTransformerBEVDepth(LSSViewTransformer):
                 depth_preds,
                 depth_labels,
                 reduction='none',
-            ).sum() / max(1.0, fg_mask.sum())
+            ).sum() / max(1.0, fg_mask.sum())   # 只对有效位置计算深度 loss
         return self.loss_depth_weight * depth_loss
 
     def forward(self, input, stereo_metas=None):
