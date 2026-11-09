@@ -19,3 +19,18 @@ class BEVDepth4DDetOcc(BEVDetDetOcc, BEVDepth4D):
             return super().forward_train(**kwargs)
         finally:
             self.pts_bbox_head._precomputed_targets = None
+
+
+from mmcv.runner import HOOKS, Hook
+from torch import nn
+
+@HOOKS.register_module()
+class D1BackboneBatchNormHook(Hook):
+    """Preserve SDK folded backbone BN; downstream BN learns temporal features."""
+    def before_train_iter(self, runner):
+        model = runner.model
+        while hasattr(model, 'module'):
+            model = model.module
+        for layer in model.img_backbone.modules():
+            if isinstance(layer, nn.modules.batchnorm._BatchNorm):
+                layer.eval()

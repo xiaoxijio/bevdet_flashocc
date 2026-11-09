@@ -1,9 +1,3 @@
-# OCC width ablation: feature width 128, predictor hidden width 256.
-# D1: B0 no-SE + BEVDepth4D longterm + joint 2D FlashOCC.
-# 4 GPUs x 2 samples; 9 frames/sample. No autoscale-lr.
-# Initialization: backbone extracted from ckpt/g5.pth; all other modules fresh.
-# Folded BN hook follows G6 and freezes running statistics for ALL BN modules.
-# Bilinear Resize align_corners=False targets ONNX pytorch_half_pixel; verify export.
 point_cloud_range = [-51.2, -51.2, -5.0, 51.2, 51.2, 3.0]
 class_names = [
     'car', 'truck', 'construction_vehicle', 'bus', 'trailer', 'barrier',
@@ -186,8 +180,8 @@ eval_pipeline = [
     dict(type='Collect3D', keys=['points'])
 ]
 data = dict(
-    samples_per_gpu=2,
-    workers_per_gpu=8,
+    samples_per_gpu=12,
+    workers_per_gpu=12,
     train=dict(
         type='CBGSDataset',
         data_root='data/nuscenes/',
@@ -552,8 +546,8 @@ log_config = dict(
            dict(type='TensorboardLoggerHook')])
 dist_params = dict(backend='nccl')
 log_level = 'INFO'
-work_dir = './work_dirs/ep3_d1_b0_longterm_depth_flashocc'
-load_from = './ckpt/d1_b0_backbone_init.pth'
+work_dir = './work_dirs/ep3_d1_g5init_b12_w12'
+load_from = 'ckpt/d1_g5_temporal_init.pth'
 resume_from = None
 workflow = [('train', 1)]
 opencv_num_threads = 0
@@ -645,11 +639,48 @@ model = dict(
             voxel_size=[0.1, 0.1],
             code_size=9),
         separate_head=dict(
-            type='SeparateHead', init_bias=-2.19, final_kernel=3),
+            type='SeparateHead',
+            init_bias=-2.19,
+            final_kernel=3,
+            in_channels=64,
+            heads=dict(
+                reg=(2, 2),
+                height=(1, 2),
+                dim=(3, 2),
+                rot=(2, 2),
+                vel=(2, 2),
+                heatmap=(10, 2)),
+            num_cls=10),
         loss_cls=dict(
             type='GaussianFocalLoss', reduction='mean', loss_weight=6.0),
         loss_bbox=dict(type='L1Loss', reduction='mean', loss_weight=1.5),
-        norm_bbox=True),
+        norm_bbox=True,
+        train_cfg=dict(
+            point_cloud_range=[-51.2, -51.2, -5.0, 51.2, 51.2, 3.0],
+            grid_size=[1024, 1024, 40],
+            voxel_size=[0.1, 0.1, 0.2],
+            out_size_factor=8,
+            dense_reg=1,
+            gaussian_overlap=0.1,
+            max_objs=500,
+            min_radius=2,
+            code_weights=[1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]),
+        test_cfg=dict(
+            pc_range=[-51.2, -51.2],
+            post_center_limit_range=[-61.2, -61.2, -10.0, 61.2, 61.2, 10.0],
+            max_per_img=500,
+            max_pool_nms=False,
+            min_radius=[4, 12, 10, 1, 0.85, 0.175],
+            score_threshold=0.1,
+            out_size_factor=8,
+            voxel_size=[0.1, 0.1],
+            pre_max_size=1000,
+            post_max_size=500,
+            nms_type=['rotate'],
+            nms_thr=[0.2],
+            nms_rescale_factor=[[
+                1.0, 0.7, 0.7, 0.4, 0.55, 1.1, 1.0, 1.0, 1.5, 3.5
+            ]])),
     train_cfg=dict(
         pts=dict(
             point_cloud_range=[-51.2, -51.2, -5.0, 51.2, 51.2, 3.0],
@@ -805,7 +836,7 @@ lr_config = dict(
     step=[16, 19])
 runner = dict(type='EpochBasedRunner', max_epochs=20)
 custom_hooks = [
-    dict(type='G5FoldedBatchNormHook', priority='HIGH'),
+    dict(type='D1BackboneBatchNormHook', priority='HIGH'),
     dict(type='MEGVIIEMAHook', init_updates=0, priority='NORMAL')
 ]
 custom_imports = dict(
@@ -818,5 +849,6 @@ custom_imports = dict(
     ],
     allow_failed_imports=False)
 auto_resume = False
-fp16 = dict(loss_scale=dict(init_scale=512.0, growth_interval=2000))
+fp16 = dict(loss_scale=dict(init_scale=32.0, growth_interval=2000))
 find_unused_parameters = False
+cudnn_benchmark = True
